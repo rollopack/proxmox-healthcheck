@@ -49,8 +49,18 @@
 # ARC hit ratio, percentage (< warn). 0 keeps it informational only.
 # PH_THRESH_ARC_HIT_WARN=0
 
-# SSD/NVMe wear: consumed life percentage (>= warn).
+# SSD/NVMe wear: consumed life percentage (>= warn). For SATA drives this is
+# only applied to an explicit remaining-life attribute, or to P/E cycle
+# counters when PH_THRESH_SSD_PE_CYCLES is set. A bare vendor wear indicator
+# (Media_Wearout_Indicator / Wear_Leveling_Count) is reported but only warns
+# when corroborated by other signals, because its meaning varies by vendor.
 # PH_THRESH_SSD_WEAR_WARN=80
+
+# Rated P/E (program/erase) cycles per NAND block for the installed SSDs.
+# 0 means unknown: P/E counters are reported but not rated. Set it to the
+# manufacturer rating (e.g. 1000 for TLC, 3000 for MLC) to warn when the
+# maximum P/E count reaches PH_THRESH_SSD_WEAR_WARN% of the rating.
+# PH_THRESH_SSD_PE_CYCLES=0
 
 # Reallocated sectors (> warn).
 # PH_THRESH_REALLOC_WARN=0

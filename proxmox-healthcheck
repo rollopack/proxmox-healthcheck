@@ -22,7 +22,7 @@ set -uo pipefail
 export LC_ALL=C
 
 PH_PROG="proxmox-healthcheck"
-PH_VERSION="0.1.0"
+PH_VERSION="0.1.1"
 
 # ---------------------------------------------------------------------------
 # Defaults (overridden by: config file -> environment -> command line)
@@ -50,6 +50,7 @@ PH_THRESH_RAM_OVERCOMMIT_WARN="${PH_THRESH_RAM_OVERCOMMIT_WARN:-1.2}"
 PH_THRESH_ARC_HIT_WARN="${PH_THRESH_ARC_HIT_WARN:-0}"      # 0 = informational only
 PH_THRESH_SWAP_WARN_PCT="${PH_THRESH_SWAP_WARN_PCT:-10}"    # warn if swap used >= % of total
 PH_THRESH_SSD_WEAR_WARN="${PH_THRESH_SSD_WEAR_WARN:-80}"   # % of life consumed
+PH_THRESH_SSD_PE_CYCLES="${PH_THRESH_SSD_PE_CYCLES:-0}"    # rated P/E cycles (0 = unknown)
 PH_THRESH_REALLOC_WARN="${PH_THRESH_REALLOC_WARN:-0}"      # reallocated sectors
 PH_THRESH_TEMP_WARN="${PH_THRESH_TEMP_WARN:-70}"
 PH_THRESH_TEMP_CRIT="${PH_THRESH_TEMP_CRIT:-85}"
@@ -727,6 +728,30 @@ do_zfs_iostat() {
 # ---------------------------------------------------------------------------
 # Checks: storage
 # ---------------------------------------------------------------------------
+
+# Parse values out of a smartctl attribute table (kept in SMART_TEXT).
+# Attribute names may be truncated by smartctl, so a prefix match is used.
+SMART_TEXT=""
+smart_field() {  # <column> <name>...  -> column of the first matching attribute
+    local idx="$1"; shift
+    local name v
+    for name in "$@"; do
+        v=$(printf '%s\n' "$SMART_TEXT" | awk -v n="$name" -v i="$idx" \
+            '($2 == n || index($2, n) == 1 || index(n, $2) == 1) { print $i; exit }')
+        if [[ -n $v ]]; then printf '%s\n' "$v"; return 0; fi
+    done
+    return 0
+}
+smart_raw() {  # <name>...  -> first numeric field of RAW_VALUE
+    local name v
+    for name in "$@"; do
+        v=$(printf '%s\n' "$SMART_TEXT" | awk -v n="$name" \
+            '($2 == n || index($2, n) == 1 || index(n, $2) == 1) { for (i = 10; i <= NF; i++) if ($i ~ /^-?[0-9]+$/) { print $i; exit } }')
+        if [[ -n $v ]]; then printf '%s\n' "$v"; return 0; fi
+    done
+    return 0
+}
+
 do_storage_smart() {
     check_begin storage.smart "$(check_title storage.smart)"
     if ! have smartctl; then
@@ -738,6 +763,7 @@ do_storage_smart() {
     # Collect unique disks across all pools.
     declare -A seen=()
     local pool dev real pct_used wear realloc poh temp spare
+    local life_remain pe_max pe_avg grown corroborated
     for pool in "${PH_POOLS[@]}"; do
         while IFS= read -r dev; do
             [[ -z $dev ]] && continue
@@ -755,29 +781,80 @@ do_storage_smart() {
                 continue
             fi
 
+            SMART_TEXT="$out"
+            # NVMe style fields (colon separated).
             pct_used=$(printf '%s\n' "$out" | awk -F: '/Percentage Used/{gsub(/[^0-9]/, "", $2); print $2; exit}')
             spare=$(printf '%s\n' "$out" | awk -F: '/Available Spare:/{gsub(/[^0-9]/, "", $2); print $2; exit}')
-            wear=$(printf '%s\n' "$out" | awk '/^ *[0-9]+ +(Wear_Leveling_Count|Media_Wearout_Indicat)/{print $4; exit}')
-            realloc=$(printf '%s\n' "$out" | awk '/^ *[0-9]+ +Reallocated_Sector_Ct/{print $NF; exit}')
             poh=$(printf '%s\n' "$out" | awk -F: '/Power On Hours:/{gsub(/[^0-9]/, "", $2); print $2; exit}')
-            [[ -z $poh ]] && poh=$(printf '%s\n' "$out" | awk '/^ *[0-9]+ +Power_On_Hours/{print $NF; exit}')
             temp=$(printf '%s\n' "$out" | awk -F: '/^Temperature:/{gsub(/[^0-9]/, "", $2); print $2; exit}')
             [[ -z $temp ]] && temp=$(printf '%s\n' "$out" | awk -F: '/Current Temperature:/{gsub(/[^0-9]/, "", $2); print $2; exit}')
-            [[ -z $temp ]] && temp=$(printf '%s\n' "$out" | awk '/^ *[0-9]+ +Temperature_Celsius/{print $NF; exit}')
+            # ATA attribute table fallbacks.
+            [[ -z $spare ]] && spare=$(smart_field 4 Available_Reservd_Space)
+            [[ -z $poh ]] && poh=$(smart_raw Power_On_Hours)
+            [[ -z $temp ]] && temp=$(smart_raw Temperature_Celsius)
+            life_remain=$(smart_field 4 Percent_Lifetime_Remain Percentage_Lifetime_Remain SSD_Life_Left)
+            wear=$(smart_field 4 Wear_Leveling_Count Media_Wearout_Indicator)
+            pe_max=$(smart_raw Maximum_PE_Cycles_TLC Maximum_PE_Cycles Max_PE_Cycles)
+            pe_avg=$(smart_raw Average_PE_Cycles_TLC Average_PE_Cycles)
+            grown=$(smart_raw Grown_Bad_Blocks)
+            realloc=$(smart_raw Reallocated_Sector_Ct)
 
             metric "Power-on hours" "${poh:-N/A}"
             metric "Temperature (C)" "${temp:-N/A}"
-            [[ -n $pct_used ]] && metric "NVMe percentage used (%)" "$pct_used"
-            [[ -n $wear ]] && metric "Wear (remaining %)" "$wear"
-            [[ -n $realloc ]] && metric "Reallocated sectors" "$realloc"
             [[ -n $spare ]] && metric "Available spare (%)" "$spare"
+            [[ -n $pct_used ]] && metric "NVMe percentage used (%)" "$pct_used"
+            [[ -n $life_remain ]] && metric "Remaining life (%)" "$life_remain"
+            [[ -n $wear ]] && metric "Vendor wear indicator" "$wear"
+            [[ -n $pe_avg ]] && metric "Average P/E cycles" "$pe_avg"
+            [[ -n $pe_max ]] && metric "Max P/E cycles" "$pe_max"
+            [[ -n $grown ]] && metric "Grown bad blocks" "$grown"
+            [[ -n $realloc ]] && metric "Reallocated sectors" "$realloc"
 
+            # NVMe percentage used: authoritative.
             if is_number "${pct_used:-}" && ge "$pct_used" "$PH_THRESH_SSD_WEAR_WARN"; then
                 warn "$real: NVMe wear ${pct_used}% >= ${PH_THRESH_SSD_WEAR_WARN}%"
             fi
-            if is_number "${wear:-}" && lt "$wear" "$((100 - PH_THRESH_SSD_WEAR_WARN))"; then
-                warn "$real: SSD remaining life ${wear}% below threshold"
+
+            # Explicit remaining-life attribute: authoritative.
+            if is_number "${life_remain:-}"; then
+                local life_used
+                life_used=$(awk -v v="$life_remain" 'BEGIN { printf "%d", 100 - v }')
+                if ge "$life_used" "$PH_THRESH_SSD_WEAR_WARN"; then
+                    warn "$real: SSD life used ${life_used}% >= ${PH_THRESH_SSD_WEAR_WARN}% (${life_remain}% remaining)"
+                fi
             fi
+
+            # P/E cycle counters: used when a rated endurance is configured.
+            if is_number "${pe_max:-}"; then
+                if is_number "$PH_THRESH_SSD_PE_CYCLES" && gt "$PH_THRESH_SSD_PE_CYCLES" 0; then
+                    local pe_used pe_str
+                    pe_used=$(pct_of "$pe_max" "$PH_THRESH_SSD_PE_CYCLES")
+                    pe_str="max ${pe_max}"
+                    [[ -n $pe_avg ]] && pe_str="${pe_str}, avg ${pe_avg}"
+                    if is_number "$pe_used" && ge "$pe_used" "$PH_THRESH_SSD_WEAR_WARN"; then
+                        warn "$real: P/E cycles (${pe_str}) at ${pe_used}% of rated ${PH_THRESH_SSD_PE_CYCLES}"
+                    fi
+                else
+                    info "$real: P/E counters present (max ${pe_max}); set PH_THRESH_SSD_PE_CYCLES to rate the wear"
+                fi
+            fi
+
+            # Vendor wear indicator: only when no authoritative source exists and
+            # only if corroborated by another wear or failure signal.
+            if [[ -z $life_remain ]] && ! is_number "${pe_max:-}" && ! is_number "${pct_used:-}"; then
+                if is_number "${wear:-}" && lt "$wear" "$((100 - PH_THRESH_SSD_WEAR_WARN))"; then
+                    corroborated=0
+                    if is_number "${realloc:-}" && gt "$realloc" 0; then corroborated=1; fi
+                    if is_number "${grown:-}" && gt "$grown" 0; then corroborated=1; fi
+                    if is_number "${spare:-}" && lt "$spare" 100; then corroborated=1; fi
+                    if (( corroborated == 1 )); then
+                        warn "$real: SSD remaining life ${wear}% below threshold (vendor indicator)"
+                    else
+                        info "$real: vendor wear indicator reports ${wear}% but no corroborating defects; not flagged as worn"
+                    fi
+                fi
+            fi
+
             if is_number "${realloc:-}" && gt "$realloc" "$PH_THRESH_REALLOC_WARN"; then
                 warn "$real: ${realloc} reallocated sector(s)"
             fi

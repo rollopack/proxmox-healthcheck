@@ -1,8 +1,69 @@
 #!/usr/bin/env bash
-cat <<'OUT'
-SMART Attributes Data Structure revision number: 16
+# Fake smartctl output selected by $PH_TEST_SMART (default: sata-pe).
+# All profiles use the real smartctl attribute-table layout, including the
+# "(Min/Max ...)" suffix on Temperature_Celsius.
+attr_table() {
+    cat <<'OUT'
+SMART Attributes Data Structure revision number: 4
+Vendor Specific SMART Attributes with Thresholds:
 ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
-  5 Reallocated_Sector_Ct   0x0033   100   100   010    Pre-fail  Always       -       0
-  9 Power_On_Hours          0x0032   090   090   000    Old_age   Always       -       12345
-194 Temperature_Celsius     0x0022   060   045   000    Old_age   Always       -       40
 OUT
+}
+
+temperature_row() {
+    printf '194 Temperature_Celsius     0x0022   067   051   ---    Old_age   Always       -       %s (Min/Max 23/51)\n' "$1"
+}
+
+case "${PH_TEST_SMART:-sata-pe}" in
+    # Real-world SATA drive: vendor indicator says 6% while real P/E counters
+    # and spare space show almost no wear -> must NOT warn.
+    sata-pe)
+        attr_table
+        cat <<'OUT'
+  5 Reallocated_Sector_Ct   0x0032   100   100   ---    Old_age   Always       -       0
+  9 Power_On_Hours          0x0032   100   100   ---    Old_age   Always       -       13855
+173 Average_PE_Cycles_TLC   0x0032   100   100   ---    Old_age   Always       -       33
+168 Maximum_PE_Cycles_TLC   0x0032   100   100   ---    Old_age   Always       -       93
+170 Grown_Bad_Blocks       0x0032   100   100   ---    Old_age   Always       -       0
+230 Media_Wearout_Indicator 0x0032   006   006   ---    Old_age   Always       -       0x060e031e060e
+232 Available_Reservd_Space 0x0033   100   100   004    Pre-fail  Always       -       100
+241 Host_Writes_GiB         0x0030   253   253   ---    Old_age   Offline      -       40246
+OUT
+        temperature_row 33
+        ;;
+    # Vendor indicator low AND corroborated by grown bad blocks -> warn.
+    sata-worn)
+        attr_table
+        cat <<'OUT'
+  5 Reallocated_Sector_Ct   0x0032   100   100   ---    Old_age   Always       -       0
+  9 Power_On_Hours          0x0032   100   100   ---    Old_age   Always       -       20000
+170 Grown_Bad_Blocks       0x0032   100   100   ---    Old_age   Always       -       5
+230 Media_Wearout_Indicator 0x0032   006   006   ---    Old_age   Always       -       0x060e031e060e
+232 Available_Reservd_Space 0x0033   080   080   004    Pre-fail  Always       -       80
+OUT
+        temperature_row 35
+        ;;
+    # Vendor indicator low but nothing corroborates it -> informational only.
+    sata-uncorroborated)
+        attr_table
+        cat <<'OUT'
+  5 Reallocated_Sector_Ct   0x0032   100   100   ---    Old_age   Always       -       0
+  9 Power_On_Hours          0x0032   100   100   ---    Old_age   Always       -       900
+170 Grown_Bad_Blocks       0x0032   100   100   ---    Old_age   Always       -       0
+230 Media_Wearout_Indicator 0x0032   006   006   ---    Old_age   Always       -       0x060e031e060e
+232 Available_Reservd_Space 0x0033   100   100   004    Pre-fail  Always       -       100
+OUT
+        temperature_row 30
+        ;;
+    # Explicit remaining-life attribute -> authoritative.
+    sata-lifetime)
+        attr_table
+        cat <<'OUT'
+  5 Reallocated_Sector_Ct   0x0032   100   100   ---    Old_age   Always       -       0
+  9 Power_On_Hours          0x0032   100   100   ---    Old_age   Always       -       5000
+202 Percent_Lifetime_Remain 0x0033   010   010   000    Pre-fail  Always       -       10
+232 Available_Reservd_Space 0x0033   100   100   004    Pre-fail  Always       -       100
+OUT
+        temperature_row 28
+        ;;
+esac

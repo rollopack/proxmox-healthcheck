@@ -71,11 +71,27 @@ Runs `zpool iostat -v <pool>` for `PH_IO_SAMPLES` samples. Informational.
 
 For every unique disk backing the selected pools:
 
-- Power-on hours, temperature, NVMe percentage used, wear/remaining life,
-  reallocated sectors, available spare.
-- WARNING: NVMe wear at `PH_THRESH_SSD_WEAR_WARN`%; remaining life below
-  `100 - PH_THRESH_SSD_WEAR_WARN`%; reallocated sectors above
-  `PH_THRESH_REALLOC_WARN`; temperature at `PH_THRESH_TEMP_WARN`.
+- Metrics: power-on hours, temperature, NVMe percentage used, available spare,
+  reallocated sectors, plus whichever wear sources the drive exposes:
+  - remaining-life attribute (`Percent_Lifetime_Remain`,
+    `Percentage_Lifetime_Remain`, `SSD_Life_Left`);
+  - P/E cycle counters (`Maximum_PE_Cycles*`, `Average_PE_Cycles*`);
+  - the vendor wear indicator (`Media_Wearout_Indicator`,
+    `Wear_Leveling_Count`).
+- WARNING sources, in order of precedence:
+  1. NVMe percentage used at `PH_THRESH_SSD_WEAR_WARN`%;
+  2. remaining-life attribute below `100 - PH_THRESH_SSD_WEAR_WARN`%;
+  3. P/E counters at `PH_THRESH_SSD_WEAR_WARN`% of `PH_THRESH_SSD_PE_CYCLES`
+     (only when that rating is set, `> 0`);
+  4. vendor wear indicator below `100 - PH_THRESH_SSD_WEAR_WARN`%, but only
+     when no authoritative source above is available **and** it is corroborated
+     by another signal (reallocated sectors `> 0`, grown bad blocks `> 0`, or
+     available spare `< 100`).
+- The vendor wear indicator alone is informative only: its meaning differs
+  between vendors (some report remaining life, others a firmware-specific
+  packed value), so an uncorroborated low reading does not raise a WARNING.
+- Other warnings: reallocated sectors above `PH_THRESH_REALLOC_WARN`,
+  temperature at `PH_THRESH_TEMP_WARN`.
 - CRITICAL: temperature at `PH_THRESH_TEMP_CRIT`.
 - Skipped when `smartctl` is missing; individual devices with no readable data
   are reported as informational notes.

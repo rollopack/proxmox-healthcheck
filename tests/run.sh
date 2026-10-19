@@ -54,6 +54,8 @@ run() {
         PH_TEST_FRAG="${PH_TEST_FRAG:-5}" \
         PH_TEST_CAP="${PH_TEST_CAP:-42}" \
         PH_TEST_ERRORS="${PH_TEST_ERRORS:-No known data errors}" \
+        PH_TEST_SMART="${PH_TEST_SMART:-sata-pe}" \
+        PH_THRESH_SSD_PE_CYCLES="${PH_TEST_PE_RATING:-0}" \
         "$BASH_BIN" "$SCRIPT" --no-color "$@" 2>&1)
     RC=$?
 }
@@ -125,13 +127,57 @@ assert_rc 0
 assert_contains "Fragmentation"
 
 # ---------------------------------------------------------------------------
-scenario "storage.smart parses ATA temperature and wear data"
+scenario "storage.smart parses raw values with trailing text"
+PH_TEST_SMART=sata-pe; PH_TEST_PE_RATING=0
 make_bin; add_proxmox
 run -c storage.smart
 assert_rc 0
 assert_contains "Power-on hours"
-assert_matches "Temperature \\(C\\) +40"
+assert_matches "Temperature \\(C\\) +33$"
+assert_not_contains "23/51"
 assert_matches "Reallocated sectors +0"
+
+# ---------------------------------------------------------------------------
+scenario "storage.smart does not warn on a vendor indicator contradicted by P/E counters"
+PH_TEST_SMART=sata-pe; PH_TEST_PE_RATING=0
+make_bin; add_proxmox
+run -c storage.smart
+assert_rc 0
+assert_matches "Max P/E cycles +93"
+assert_not_contains "below threshold"
+assert_contains "set PH_THRESH_SSD_PE_CYCLES"
+
+# ---------------------------------------------------------------------------
+scenario "storage.smart warns from P/E counters when the rated endurance is set"
+PH_TEST_SMART=sata-pe; PH_TEST_PE_RATING=100
+make_bin; add_proxmox
+run -c storage.smart
+assert_rc 1
+assert_contains "at 93.0% of rated 100"
+
+# ---------------------------------------------------------------------------
+scenario "storage.smart warns on a corroborated low wear indicator"
+PH_TEST_SMART=sata-worn; PH_TEST_PE_RATING=0
+make_bin; add_proxmox
+run -c storage.smart
+assert_rc 1
+assert_contains "SSD remaining life 006% below threshold"
+
+# ---------------------------------------------------------------------------
+scenario "storage.smart reports an uncorroborated wear indicator without warning"
+PH_TEST_SMART=sata-uncorroborated; PH_TEST_PE_RATING=0
+make_bin; add_proxmox
+run -c storage.smart
+assert_rc 0
+assert_contains "not flagged as worn"
+
+# ---------------------------------------------------------------------------
+scenario "storage.smart warns on explicit remaining-life attribute"
+PH_TEST_SMART=sata-lifetime; PH_TEST_PE_RATING=0
+make_bin; add_proxmox
+run -c storage.smart
+assert_rc 1
+assert_contains "SSD life used 90% >= 80%"
 
 # ---------------------------------------------------------------------------
 scenario "no Proxmox/ZFS tooling present"
