@@ -37,7 +37,29 @@ error.
 
 ## Installation
 
-The script is a single file. Copy it anywhere and make it executable:
+`proxmox-healthcheck` is a single, self-contained script.
+
+### Quick install (download)
+
+Download the script and make it executable (`wget` is available by default on
+Proxmox VE):
+
+```sh
+wget -O /usr/local/bin/proxmox-healthcheck \
+  https://raw.githubusercontent.com/rollopack/proxmox-healthcheck/main/proxmox-healthcheck
+chmod 0755 /usr/local/bin/proxmox-healthcheck
+```
+
+Optional configuration file:
+
+```sh
+wget -O /etc/proxmox-healthcheck.conf \
+  https://raw.githubusercontent.com/rollopack/proxmox-healthcheck/main/proxmox-healthcheck.conf.example
+```
+
+### From a local copy
+
+Copy the script anywhere and make it executable:
 
 ```sh
 install -m 0755 proxmox-healthcheck /usr/local/bin/proxmox-healthcheck
@@ -49,7 +71,7 @@ Optional configuration file:
 install -m 0644 proxmox-healthcheck.conf.example /etc/proxmox-healthcheck.conf
 ```
 
-To update, just replace the file.
+To update, simply replace the file with the desired version.
 
 ## Usage
 
