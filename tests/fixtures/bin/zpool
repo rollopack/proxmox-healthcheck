@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Fake zpool, parameterised through PH_TEST_* environment variables.
+health="${PH_TEST_HEALTH:-ONLINE}"
+frag="${PH_TEST_FRAG:-5}"
+cap="${PH_TEST_CAP:-42}"
+errors="${PH_TEST_ERRORS:-No known data errors}"
+recent=$(date -d '5 days ago' '+%a %b %e %H:%M:%S %Y' 2>/dev/null)
+[ -z "$recent" ] && recent="Sun Jan  1 03:00:00 2026"
+pool="rpool"
+
+print_status() {
+  printf '  pool: %s\n' "$pool"
+  printf ' state: %s\n' "$health"
+  printf '  scan: scrub repaired 0B in 00:10:00 with 0 errors on %s\n' "$recent"
+  printf 'config:\n\n'
+  printf '\tNAME        STATE     READ WRITE CKSUM\n'
+  printf '\t%s      %s       0     0     0\n' "$pool" "$health"
+  printf '\t  /dev/sda  ONLINE       0     0     0\n\n'
+  printf 'errors: %s\n' "$errors"
+}
+
+case "$*" in
+  "list -H -o name"*)          echo "$pool" ;;
+  "list -H -o health"*)        echo "$health" ;;
+  "list -Hp -o capacity"*)     echo "$cap" ;;
+  "list -Hp -o fragmentation"*) echo "$frag" ;;
+  "get -H -o value autotrim"*) echo on ;;
+  "get -H -o value dedupratio"*) echo 1.00 ;;
+  "get -H -o value dedup "*)    echo off ;;
+  "status -P"*)                printf '\t/dev/sda\n' ;;
+  "status -t"*)                printf '%s  trim: supported\n' "$pool" ;;
+  "status -v"*|"status"*)      print_status ;;
+  iostat*)                     echo "                         capacity     operations     bandwidth"; echo "  $pool                    42%            12      1.2M" ;;
+  *)                           exit 0 ;;
+esac

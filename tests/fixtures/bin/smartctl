@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+cat <<'OUT'
+SMART Attributes Data Structure revision number: 16
+ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+  5 Reallocated_Sector_Ct   0x0033   100   100   010    Pre-fail  Always       -       0
+  9 Power_On_Hours          0x0032   090   090   000    Old_age   Always       -       12345
+194 Temperature_Celsius     0x0022   060   045   000    Old_age   Always       -       40
+OUT

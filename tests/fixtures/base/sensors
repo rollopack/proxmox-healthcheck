@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+cat <<'OUT'
+k10temp-pci-00c3
+Adapter: PCI adapter
+Tctl:         +40.0C
+
+nct6775-isa-0290
+Adapter: ISA adapter
+fan1:         800 RPM
+CPUTIN:       +45.0C
+OUT

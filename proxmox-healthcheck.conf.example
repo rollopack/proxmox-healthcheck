@@ -1,0 +1,63 @@
+# proxmox-healthcheck configuration file
+#
+# This file is sourced by the script, so it must contain valid shell
+# assignments (no "export" needed).
+#
+# Precedence, from lowest to highest:
+#   built-in defaults  <  this file  <  PH_* environment  <  command line
+#
+# Copy it to /etc/proxmox-healthcheck.conf and edit as needed.
+
+# ---------------------------------------------------------------------------
+# Paths and general settings
+# ---------------------------------------------------------------------------
+
+# Default configuration file path (used by --config).
+# PH_CONFIG="/etc/proxmox-healthcheck.conf"
+
+# ZFS ARC statistics file.
+# PH_ARCSTATS="/proc/spl/kstat/zfs/arcstats"
+
+# Network interfaces file used to discover bridges.
+# PH_NET_INTERFACES="/etc/network/interfaces"
+
+# Number of samples for iostat / zpool iostat (each sample is ~1 second).
+# PH_IO_SAMPLES=5
+
+# ---------------------------------------------------------------------------
+# Thresholds
+# ---------------------------------------------------------------------------
+
+# Pool capacity, percentage (>= warn, >= crit).
+# PH_THRESH_POOL_CAP_WARN=80
+# PH_THRESH_POOL_CAP_CRIT=90
+
+# Pool fragmentation, percentage (>= warn).
+# PH_THRESH_POOL_FRAG_WARN=50
+
+# Days since the last scrub (>= warn, >= crit).
+# PH_THRESH_SCRUB_WARN_DAYS=30
+# PH_THRESH_SCRUB_CRIT_DAYS=60
+
+# vCPU / RAM overcommit ratios (> warn).
+# PH_THRESH_VCPU_OVERCOMMIT_WARN=4.0
+# PH_THRESH_RAM_OVERCOMMIT_WARN=1.2
+
+# Swap usage, percentage of total swap (>= warn). 0 disables the warning.
+# PH_THRESH_SWAP_WARN_PCT=10
+
+# ARC hit ratio, percentage (< warn). 0 keeps it informational only.
+# PH_THRESH_ARC_HIT_WARN=0
+
+# SSD/NVMe wear: consumed life percentage (>= warn).
+# PH_THRESH_SSD_WEAR_WARN=80
+
+# Reallocated sectors (> warn).
+# PH_THRESH_REALLOC_WARN=0
+
+# Disk temperature in Celsius (>= warn, >= crit).
+# PH_THRESH_TEMP_WARN=70
+# PH_THRESH_TEMP_CRIT=85
+
+# Age in days of the most recent backup task (informational threshold).
+# PH_THRESH_BACKUP_AGE_DAYS=7

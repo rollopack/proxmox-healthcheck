@@ -1,0 +1,1331 @@
+#!/usr/bin/env bash
+#
+# proxmox-healthcheck - diagnostics and integrity checks for a Proxmox VE
+# node/cluster and its ZFS storage, VMs and LXC containers.
+#
+# Design goals:
+#   - no hardcoded pools/disks/guests: everything is auto-discovered
+#   - the check layer only records results; the report layer prints them
+#   - tools that are missing make a check skip, never fail
+#
+# Exit codes: 0 = OK, 1 = at least one WARNING or CRITICAL, 2 = usage/setup error
+#
+# License: MIT
+
+# NOTE: `set -e` is intentionally NOT used. Several checks rely on commands
+# that are expected to fail (grep with no match, zpool/zfs probes, optional
+# tools). We still want `-u` and `pipefail` for robustness.
+set -uo pipefail
+
+# Force a deterministic locale: zpool/zfs/date output must be parsed reliably
+# regardless of the system locale.
+export LC_ALL=C
+
+PH_PROG="proxmox-healthcheck"
+PH_VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# Defaults (overridden by: config file -> environment -> command line)
+# ---------------------------------------------------------------------------
+PH_CONFIG="${PH_CONFIG:-/etc/proxmox-healthcheck.conf}"
+
+PH_SELECT=""            # comma separated list of check ids
+PH_POOL_OPT=""          # comma separated list of pools (empty = auto-discovery)
+PH_NODE=""              # Proxmox node name (empty = auto-detect)
+PH_OUTPUT=""            # optional report file
+PH_NO_COLOR=0
+PH_QUIET=0
+PH_IO_SAMPLES="${PH_IO_SAMPLES:-5}"
+PH_ARCSTATS="${PH_ARCSTATS:-/proc/spl/kstat/zfs/arcstats}"
+PH_NET_INTERFACES="${PH_NET_INTERFACES:-/etc/network/interfaces}"
+
+# Thresholds
+PH_THRESH_POOL_CAP_WARN="${PH_THRESH_POOL_CAP_WARN:-80}"
+PH_THRESH_POOL_CAP_CRIT="${PH_THRESH_POOL_CAP_CRIT:-90}"
+PH_THRESH_POOL_FRAG_WARN="${PH_THRESH_POOL_FRAG_WARN:-50}"
+PH_THRESH_SCRUB_WARN_DAYS="${PH_THRESH_SCRUB_WARN_DAYS:-30}"
+PH_THRESH_SCRUB_CRIT_DAYS="${PH_THRESH_SCRUB_CRIT_DAYS:-60}"
+PH_THRESH_VCPU_OVERCOMMIT_WARN="${PH_THRESH_VCPU_OVERCOMMIT_WARN:-4.0}"
+PH_THRESH_RAM_OVERCOMMIT_WARN="${PH_THRESH_RAM_OVERCOMMIT_WARN:-1.2}"
+PH_THRESH_ARC_HIT_WARN="${PH_THRESH_ARC_HIT_WARN:-0}"      # 0 = informational only
+PH_THRESH_SWAP_WARN_PCT="${PH_THRESH_SWAP_WARN_PCT:-10}"    # warn if swap used >= % of total
+PH_THRESH_SSD_WEAR_WARN="${PH_THRESH_SSD_WEAR_WARN:-80}"   # % of life consumed
+PH_THRESH_REALLOC_WARN="${PH_THRESH_REALLOC_WARN:-0}"      # reallocated sectors
+PH_THRESH_TEMP_WARN="${PH_THRESH_TEMP_WARN:-70}"
+PH_THRESH_TEMP_CRIT="${PH_THRESH_TEMP_CRIT:-85}"
+PH_THRESH_BACKUP_AGE_DAYS="${PH_THRESH_BACKUP_AGE_DAYS:-7}"
+
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+setup_colors() {
+    if [[ $PH_NO_COLOR -eq 1 || -n "${NO_COLOR:-}" || ! -t 1 ]]; then
+        C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""
+    else
+        C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+        C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+    fi
+}
+C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+err() { printf '%s: %s\n' "$PH_PROG" "$*" >&2; }
+
+# Write a line to the report file (if any) and to stdout (unless quiet).
+_emit() {
+    local text="$1" color="${2:-}"
+    [[ -n $PH_OUTPUT ]] && printf '%s\n' "$text" >>"$PH_OUTPUT"
+    [[ $PH_QUIET -eq 1 ]] && return 0
+    if [[ -n $color ]]; then
+        printf '%b%s%b\n' "$color" "$text" "$C_RESET"
+    else
+        printf '%s\n' "$text"
+    fi
+}
+
+# Like _emit but never silenced by --quiet (used for the final summary).
+_emit_force() {
+    local text="$1" color="${2:-}"
+    [[ -n $PH_OUTPUT ]] && printf '%s\n' "$text" >>"$PH_OUTPUT"
+    if [[ -n $color ]]; then
+        printf '%b%s%b\n' "$color" "$text" "$C_RESET"
+    else
+        printf '%s\n' "$text"
+    fi
+}
+
+# Emit every line read from stdin, verbatim.
+raw() {
+    local line
+    while IFS= read -r line; do _emit "$line"; done
+}
+
+# ---------------------------------------------------------------------------
+# Small numeric helpers (awk based: no dependency on bc/numfmt)
+# ---------------------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+human_bytes() {
+    awk -v n="${1:-0}" 'BEGIN {
+        if (n !~ /^[0-9.]+$/) { print n; exit }
+        split("B KiB MiB GiB TiB PiB", u, " "); i = 1
+        while (n >= 1024 && i < 7) { n /= 1024; i++ }
+        printf "%.2f %s\n", n, u[i]
+    }'
+}
+
+pct_of() { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN { if (b > 0) printf "%.1f", a*100/b; else printf "N/A" }'; }
+ratio_of() { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN { if (b > 0) printf "%.2f", a/b; else printf "N/A" }'; }
+gt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
+ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
+lt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a < b) }'; }
+is_number() { awk -v n="$1" 'BEGIN { exit !(n ~ /^-?[0-9]+(\.[0-9]+)?$/) }'; }
+
+# Extract a value from a compact JSON string without jq.
+# Usage: json_get '<json>' 'key'
+json_get() {
+    awk -v k="$2" '
+        {
+            line = $0
+            pat = "\"" k "\":"
+            idx = index(line, pat)
+            if (idx == 0) next
+            rest = substr(line, idx + length(pat))
+            if (substr(rest, 1, 1) == "\"") {
+                rest = substr(rest, 2)
+                q = index(rest, "\"")
+                print substr(rest, 1, q - 1)
+            } else {
+                n = 0
+                for (i = 1; i <= length(rest); i++) {
+                    c = substr(rest, i, 1)
+                    if (c == "," || c == "}" || c == "]") break
+                    n = i
+                }
+                print substr(rest, 1, n)
+            }
+            exit
+        }
+    ' <<<"$1"
+}
+
+# Split a compact JSON array of objects into one object per line.
+json_lines() { tr -d '\n' | sed 's/},{/}\n{/g'; }
+
+# ---------------------------------------------------------------------------
+# Check bookkeeping
+# ---------------------------------------------------------------------------
+CHECKS_ALL=(
+    host.resources
+    host.systemd
+    zfs.pool_health
+    zfs.datasets
+    zfs.arc
+    zfs.trim
+    zfs.dedup
+    zfs.iostat
+    storage.smart
+    vm.overcommit
+    vm.usage
+    net.bridges
+    hardware.sensors
+    backup.status
+    replication.status
+)
+CHECKS=()
+TOTAL_SELECTED=0
+CURRENT_INDEX=0
+CURRENT_ID=""
+CURRENT_TITLE=""
+
+PH_STATUS=0                 # 0 ok, 1 warn, 2 crit
+declare -A CK_SEV=()        # per-check numeric worst severity
+declare -A CK_STATUS=()     # per-check status label
+declare -A CK_FINDINGS=()   # per-check findings (severity|message lines)
+
+check_title() {
+    case $1 in
+        host.resources)      echo "Host resources" ;;
+        host.systemd)        echo "Failed systemd units" ;;
+        zfs.pool_health)     echo "ZFS pool health" ;;
+        zfs.datasets)        echo "ZFS datasets and zvols" ;;
+        zfs.arc)             echo "ZFS ARC statistics" ;;
+        zfs.trim)            echo "ZFS TRIM status" ;;
+        zfs.dedup)           echo "ZFS dedup ratio" ;;
+        zfs.iostat)          echo "ZFS I/O statistics" ;;
+        storage.smart)       echo "Disk SMART / wear level" ;;
+        vm.overcommit)       echo "VM/CT resource overcommit" ;;
+        vm.usage)            echo "VM/CT real usage" ;;
+        net.bridges)         echo "Network bridges" ;;
+        hardware.sensors)    echo "CPU temperature and fans" ;;
+        backup.status)       echo "Backup status" ;;
+        replication.status)  echo "Replication status" ;;
+        *)                   echo "$1" ;;
+    esac
+}
+
+status_color() {
+    case $1 in
+        OK)       printf '%s' "$C_GREEN" ;;
+        WARNING)  printf '%s' "$C_YELLOW" ;;
+        CRITICAL) printf '%s' "$C_RED" ;;
+        *)        printf '%s' "$C_DIM" ;;
+    esac
+}
+
+check_begin() {
+    CURRENT_ID="$1"
+    CURRENT_TITLE="$2"
+    CURRENT_INDEX=$((CURRENT_INDEX + 1))
+    CK_SEV["$CURRENT_ID"]=0
+    CK_STATUS["$CURRENT_ID"]="ok"
+    local line="=================================================================="
+    _emit ""
+    _emit "$line" "$C_BOLD"
+    _emit "$(printf '[%d/%d] %s' "$CURRENT_INDEX" "$TOTAL_SELECTED" "$CURRENT_TITLE")" "$C_BOLD"
+    _emit "$line" "$C_BOLD"
+}
+
+# note <ok|info|warn|crit|skip> <message>
+note() {
+    local sev="$1"; shift
+    local msg="$*"
+    local color="" tag="" num=0
+    case $sev in
+        ok)   tag="[ OK ]";  color="$C_GREEN" ;;
+        info) tag="[info]";  color="$C_DIM" ;;
+        warn) tag="[WARN]";  color="$C_YELLOW"; num=1 ;;
+        crit) tag="[CRIT]";  color="$C_RED";    num=2 ;;
+        skip) tag="[skip]";  color="$C_DIM" ;;
+        *)    tag="[????]";  color="$C_DIM" ;;
+    esac
+    if [[ $sev == skip ]]; then
+        CK_STATUS["$CURRENT_ID"]="skip"
+    fi
+    if (( num > ${CK_SEV[$CURRENT_ID]:-0} )); then
+        CK_SEV["$CURRENT_ID"]=$num
+    fi
+    if (( num > PH_STATUS )); then
+        PH_STATUS=$num
+    fi
+    CK_FINDINGS["$CURRENT_ID"]+="${sev}|${msg}"$'\n'
+    _emit "$tag $msg" "$color"
+}
+
+ok()   { note ok "$@"; }
+info() { note info "$@"; }
+warn() { note warn "$@"; }
+crit() { note crit "$@"; }
+skip() { note skip "$@"; }
+
+# metric <label> <value>
+metric() {
+    local label="$1" value="${2:-}"
+    _emit "$(printf '  %-30s %s' "$label" "$value")"
+}
+
+# Print a sub-heading inside a check.
+subhead() { _emit "" ; _emit "-- $*" "$C_CYAN"; }
+
+check_end() {
+    local id="$CURRENT_ID"
+    local sev="${CK_SEV[$id]:-0}"
+    local status
+    if [[ "${CK_STATUS[$id]:-ok}" == skip ]]; then
+        status="SKIPPED"
+    elif (( sev >= 2 )); then
+        status="CRITICAL"
+    elif (( sev == 1 )); then
+        status="WARNING"
+    else
+        status="OK"
+    fi
+    _emit "Result: $status" "$(status_color "$status")"
+}
+
+# ---------------------------------------------------------------------------
+# Auto-discovery
+# ---------------------------------------------------------------------------
+PH_POOLS=()
+PH_GUEST_TYPE=()   # qemu|lxc
+PH_GUEST_ID=()
+PH_GUEST_NAME=()
+PH_GUEST_STATUS=()
+
+detect_node() {
+    [[ -n $PH_NODE ]] && return 0
+    if have pvecm; then
+        PH_NODE=$(pvecm status 2>/dev/null | awk -F': *' '/^Name:/{print $2; exit}')
+    fi
+    [[ -n $PH_NODE ]] && return 0
+    PH_NODE=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "unknown")
+}
+
+pve_version() {
+    if have pveversion; then
+        pveversion 2>/dev/null | head -n1
+    elif [[ -r /etc/os-release ]]; then
+        awk -F= '/^PRETTY_NAME=/{gsub(/"/, "", $2); print $2}' /etc/os-release
+    else
+        echo "unknown"
+    fi
+}
+
+discover_pools() {
+    PH_POOLS=()
+    local p
+    if [[ -n $PH_POOL_OPT ]]; then
+        for p in ${PH_POOL_OPT//,/ }; do
+            if have zpool && zpool list -H -o name "$p" >/dev/null 2>&1; then
+                PH_POOLS+=("$p")
+            else
+                err "pool '$p' not found, skipping"
+            fi
+        done
+    elif have zpool; then
+        while IFS= read -r p; do
+            [[ -n $p ]] && PH_POOLS+=("$p")
+        done < <(zpool list -H -o name 2>/dev/null)
+    fi
+}
+
+discover_guests() {
+    PH_GUEST_TYPE=(); PH_GUEST_ID=(); PH_GUEST_NAME=(); PH_GUEST_STATUS=()
+    local id name st
+    if have qm; then
+        while IFS='|' read -r id name st; do
+            [[ -z $id ]] && continue
+            PH_GUEST_TYPE+=("qemu"); PH_GUEST_ID+=("$id")
+            PH_GUEST_NAME+=("$name"); PH_GUEST_STATUS+=("$st")
+        done < <(qm list 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1"|"$2"|"$3}')
+    fi
+    if have pct; then
+        while IFS='|' read -r id st name; do
+            [[ -z $id ]] && continue
+            PH_GUEST_TYPE+=("lxc"); PH_GUEST_ID+=("$id")
+            PH_GUEST_NAME+=("$name"); PH_GUEST_STATUS+=("$st")
+        done < <(pct list 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1"|"$2"|"$NF}')
+    fi
+}
+
+# Print the raw config of a guest (qm/pct config).
+guest_config() {
+    local type="$1" id="$2"
+    if [[ $type == qemu ]]; then
+        qm config "$id" 2>/dev/null
+    else
+        pct config "$id" 2>/dev/null
+    fi
+}
+
+# Extract a key from a guest config blob.
+conf_field() {
+    awk -F': *' -v k="$2" '$1 == k {print $2; exit}' <<<"$1"
+}
+
+# Leaf block devices backing a pool.
+pool_leaf_devices() {
+    local pool="$1"
+    have zpool || return 0
+    zpool status -P "$pool" 2>/dev/null | awk '
+        /^[[:space:]]/ && $1 ~ /^\/dev\// { print $1 }
+    '
+}
+
+# Resolve a partition to its whole disk.
+disk_real() {
+    local dev="$1" pk
+    pk=$(lsblk -dnr -o PKNAME "$dev" 2>/dev/null | head -n1)
+    if [[ -n $pk ]]; then
+        printf '/dev/%s\n' "$pk"
+    else
+        printf '%s\n' "$dev"
+    fi
+}
+
+# Is the pool built only on NVMe devices? (same logic as the Debian cron)
+pool_is_nvme_only() {
+    local pool="$1" dev pk trans
+    [[ -n "${pool_leaf_cache[$pool]:-}" ]] || pool_leaf_cache["$pool"]=$(pool_leaf_devices "$pool")
+    local leaves="${pool_leaf_cache[$pool]}"
+    [[ -z $leaves ]] && return 1
+    for dev in $leaves; do
+        pk=$(lsblk -dnr -o PKNAME "$dev" 2>/dev/null)
+        [[ -n $pk ]] && dev="/dev/${pk}"
+        trans=$(lsblk -dnr -o TRAN "$dev" 2>/dev/null | head -n1)
+        [[ $trans == nvme ]] || return 1
+    done
+    return 0
+}
+declare -A pool_leaf_cache=()
+
+# ---------------------------------------------------------------------------
+# Checks: host
+# ---------------------------------------------------------------------------
+do_host_resources() {
+    check_begin host.resources "$(check_title host.resources)"
+
+    local cores load
+    cores=$(nproc 2>/dev/null || echo "?")
+    metric "CPU cores (online)" "$cores"
+    load=$(uptime 2>/dev/null)
+    metric "Load / uptime" "${load:-N/A}"
+
+    if have free; then
+        metric "Memory" "$(free -h 2>/dev/null | awk '/^Mem:/{print $3" used / "$2" total"}')"
+        local swap_mb swap_total swap_pct
+        swap_mb=$(free -m 2>/dev/null | awk '/^Swap:/{print $3}')
+        swap_total=$(free -m 2>/dev/null | awk '/^Swap:/{print $2}')
+        swap_mb=${swap_mb:-0}; swap_total=${swap_total:-0}
+        swap_pct=$(pct_of "$swap_mb" "$swap_total")
+        metric "Swap used (MiB)" "${swap_mb} / ${swap_total} (${swap_pct}%)"
+        if is_number "$swap_pct" && is_number "$swap_total" && gt "$swap_total" 0 \
+           && ge "$swap_pct" "$PH_THRESH_SWAP_WARN_PCT"; then
+            warn "swap usage ${swap_pct}% >= ${PH_THRESH_SWAP_WARN_PCT}%: possible memory pressure"
+        elif is_number "$swap_mb" && gt "$swap_mb" 0; then
+            info "swap in use (${swap_mb} MiB), below warning threshold"
+        else
+            ok "no swap in use"
+        fi
+    else
+        info "'free' not available, memory usage skipped"
+    fi
+
+    if have swapon; then
+        if [[ -n "$(swapon --show 2>/dev/null)" ]]; then
+            metric "Swap devices" "present"
+        else
+            metric "Swap devices" "none"
+        fi
+    fi
+
+    if have iostat; then
+        subhead "I/O statistics (iostat -x, ${PH_IO_SAMPLES} samples)"
+        iostat -x 1 "$PH_IO_SAMPLES" 2>/dev/null | raw
+    else
+        info "'iostat' (sysstat) not installed, skipped"
+    fi
+
+    check_end
+}
+
+do_host_systemd() {
+    check_begin host.systemd "$(check_title host.systemd)"
+    if ! have systemctl; then
+        skip "systemctl not available"
+        check_end
+        return 0
+    fi
+    local failed count
+    failed=$(systemctl --failed --no-legend --plain 2>/dev/null)
+    if [[ -z $failed ]]; then
+        ok "no failed systemd units"
+    else
+        count=$(printf '%s\n' "$failed" | grep -c .)
+        warn "${count} failed systemd unit(s)"
+        printf '%s\n' "$failed" | raw
+    fi
+    check_end
+}
+
+# ---------------------------------------------------------------------------
+# Checks: ZFS
+# ---------------------------------------------------------------------------
+do_zfs_pool_health() {
+    check_begin zfs.pool_health "$(check_title zfs.pool_health)"
+    if ! have zpool; then
+        skip "zpool not available"
+        check_end
+        return 0
+    fi
+    if (( ${#PH_POOLS[@]} == 0 )); then
+        skip "no ZFS pool detected"
+        check_end
+        return 0
+    fi
+
+    local pool health cap frag scan_line errors days
+    for pool in "${PH_POOLS[@]}"; do
+        subhead "pool: $pool"
+        health=$(zpool list -H -o health "$pool" 2>/dev/null)
+        metric "Health" "${health:-unknown}"
+        if [[ $health == ONLINE ]]; then
+            ok "pool $pool is ONLINE"
+        elif [[ -n $health ]]; then
+            crit "pool $pool health is ${health}"
+        else
+            warn "pool $pool health could not be determined"
+        fi
+
+        cap=$(zpool list -Hp -o capacity "$pool" 2>/dev/null)
+        if is_number "$cap"; then
+            metric "Capacity used" "${cap}%"
+            if ge "$cap" "$PH_THRESH_POOL_CAP_CRIT"; then
+                crit "pool $pool capacity ${cap}% >= ${PH_THRESH_POOL_CAP_CRIT}%"
+            elif ge "$cap" "$PH_THRESH_POOL_CAP_WARN"; then
+                warn "pool $pool capacity ${cap}% >= ${PH_THRESH_POOL_CAP_WARN}%"
+            fi
+        fi
+
+        frag=$(zpool list -Hp -o fragmentation "$pool" 2>/dev/null)
+        if is_number "$frag"; then
+            metric "Fragmentation" "${frag}%"
+            if ge "$frag" "$PH_THRESH_POOL_FRAG_WARN"; then
+                warn "pool $pool fragmentation ${frag}% >= ${PH_THRESH_POOL_FRAG_WARN}%"
+            fi
+        else
+            metric "Fragmentation" "-"
+        fi
+
+        scan_line=$(zpool status "$pool" 2>/dev/null | grep -m1 'scan:' || true)
+        metric "Last scan" "${scan_line#*scan: }"
+        if [[ $scan_line == *"scrub in progress"* ]]; then
+            info "scrub in progress on pool $pool"
+        elif [[ $scan_line == *"resilver in progress"* ]]; then
+            warn "resilver in progress on pool $pool"
+        elif [[ $scan_line == *"none requested"* ]]; then
+            warn "pool $pool has never been scrubbed"
+        elif [[ $scan_line == *" on "* ]]; then
+            local last_epoch now_epoch
+            last_epoch=$(date -d "${scan_line##* on }" +%s 2>/dev/null || true)
+            if [[ -n $last_epoch ]]; then
+                now_epoch=$(date +%s)
+                days=$(( (now_epoch - last_epoch) / 86400 ))
+                metric "Days since last scrub" "$days"
+                if ge "$days" "$PH_THRESH_SCRUB_CRIT_DAYS"; then
+                    crit "last scrub was ${days} days ago (>= ${PH_THRESH_SCRUB_CRIT_DAYS})"
+                elif ge "$days" "$PH_THRESH_SCRUB_WARN_DAYS"; then
+                    warn "last scrub was ${days} days ago (>= ${PH_THRESH_SCRUB_WARN_DAYS})"
+                else
+                    ok "recent scrub on pool $pool (${days} days ago)"
+                fi
+            fi
+        fi
+
+        errors=$(zpool status "$pool" 2>/dev/null | grep -m1 '^errors:' || true)
+        if [[ -n $errors && $errors != *"No known data errors"* ]]; then
+            crit "pool $pool reports data errors: ${errors#errors: }"
+        fi
+
+        subhead "zpool status -v $pool"
+        zpool status -v "$pool" 2>&1 | raw
+    done
+    check_end
+}
+
+do_zfs_datasets() {
+    check_begin zfs.datasets "$(check_title zfs.datasets)"
+    if ! have zfs; then
+        skip "zfs not available"
+        check_end
+        return 0
+    fi
+    if (( ${#PH_POOLS[@]} == 0 )); then
+        skip "no ZFS pool detected"
+        check_end
+        return 0
+    fi
+    local pool
+    for pool in "${PH_POOLS[@]}"; do
+        subhead "datasets and volumes of $pool (largest first)"
+        zfs list -r -o name,used,avail,refer,ratio,compressratio -s used "$pool" 2>/dev/null | raw
+        subhead "thin provisioning: volsize vs used (zvol) in $pool"
+        zfs list -t volume -r -o name,used,avail,refreservation,volsize "$pool" 2>/dev/null | raw
+    done
+    ok "dataset listing completed"
+    check_end
+}
+
+do_zfs_arc() {
+    check_begin zfs.arc "$(check_title zfs.arc)"
+    if [[ -r $PH_ARCSTATS ]]; then
+        local hits misses size cmax cmin total hits_pct
+        hits=$(awk '/^hits /{print $3; exit}' "$PH_ARCSTATS")
+        misses=$(awk '/^misses /{print $3; exit}' "$PH_ARCSTATS")
+        size=$(awk '/^size /{print $3; exit}' "$PH_ARCSTATS")
+        cmax=$(awk '/^c_max /{print $3; exit}' "$PH_ARCSTATS")
+        cmin=$(awk '/^c_min /{print $3; exit}' "$PH_ARCSTATS")
+        metric "Current ARC size" "$(human_bytes "${size:-0}")"
+        metric "Max ARC size" "$(human_bytes "${cmax:-0}")"
+        metric "Min ARC size" "$(human_bytes "${cmin:-0}")"
+        hits=${hits:-0}; misses=${misses:-0}
+        total=$((hits + misses))
+        hits_pct=$(pct_of "$hits" "$total")
+        metric "Hit ratio" "${hits_pct}% (hits: ${hits}, misses: ${misses})"
+        if is_number "$PH_THRESH_ARC_HIT_WARN" && gt "$PH_THRESH_ARC_HIT_WARN" 0 \
+           && is_number "$hits_pct" && lt "$hits_pct" "$PH_THRESH_ARC_HIT_WARN"; then
+            warn "ARC hit ratio ${hits_pct}% < ${PH_THRESH_ARC_HIT_WARN}%"
+        else
+            info "ARC hit ratio is informational (set PH_THRESH_ARC_HIT_WARN to enable warning)"
+        fi
+    elif have arc_summary; then
+        arc_summary 2>/dev/null | grep -E "ARC size|Hit Ratio|Target size|Min size|Max size" | raw
+        info "read from arc_summary (${PH_ARCSTATS} unavailable)"
+    else
+        skip "ARC statistics not available (${PH_ARCSTATS} not readable)"
+    fi
+    check_end
+}
+
+do_zfs_trim() {
+    check_begin zfs.trim "$(check_title zfs.trim)"
+    if ! have zpool; then
+        skip "zpool not available"
+        check_end
+        return 0
+    fi
+    if (( ${#PH_POOLS[@]} == 0 )); then
+        skip "no ZFS pool detected"
+        check_end
+        return 0
+    fi
+
+    local pool autotrim periodic periodic_src unit state
+    for pool in "${PH_POOLS[@]}"; do
+        subhead "pool: $pool"
+        zpool status -t "$pool" 2>/dev/null | raw
+
+        autotrim=$(zpool get -H -o value autotrim "$pool" 2>/dev/null)
+        metric "autotrim" "${autotrim:-N/A}"
+
+        periodic="no"
+        periodic_src=""
+        for unit in "zfs-trim-weekly@${pool}.timer" "zfs-trim-monthly@${pool}.timer"; do
+            if have systemctl && systemctl is-enabled "$unit" >/dev/null 2>&1; then
+                state=$(systemctl is-active "$unit" 2>/dev/null || true)
+                metric "$unit" "${state:-unknown}"
+                if [[ $state == active ]]; then
+                    periodic="yes"; periodic_src="$unit"
+                fi
+            fi
+        done
+
+        if [[ -f /etc/cron.d/zfsutils-linux ]] && grep -q "/usr/lib/zfs-linux/trim" /etc/cron.d/zfsutils-linux 2>/dev/null; then
+            local ptrim
+            ptrim=$(zfs get -H -o value org.debian:periodic-trim "$pool" 2>/dev/null || true)
+            ptrim=${ptrim:-auto}
+            metric "org.debian:periodic-trim" "$ptrim"
+            case $ptrim in
+                enable)
+                    periodic="yes"; periodic_src="cron Debian (periodic-trim=enable)" ;;
+                disable)
+                    info "Debian monthly trim disabled for pool $pool" ;;
+                auto|"-"|"")
+                    if pool_is_nvme_only "$pool"; then
+                        periodic="yes"; periodic_src="cron Debian (auto, NVMe-only pool)"
+                    else
+                        info "in auto mode the Debian cron skips non NVMe-only pools"
+                    fi ;;
+                *)
+                    info "unrecognised org.debian:periodic-trim value: $ptrim" ;;
+            esac
+        else
+            metric "Debian trim cron" "absent"
+        fi
+
+        if [[ $autotrim == on ]]; then
+            ok "TRIM handled by ZFS autotrim (autotrim=on)"
+            [[ $periodic == yes ]] && info "an explicit periodic TRIM is also active: $periodic_src"
+        elif [[ $periodic == yes ]]; then
+            ok "TRIM handled by explicit periodic job: $periodic_src (autotrim=off)"
+        else
+            warn "no TRIM mechanism active on pool $pool (autotrim=off and no periodic job)"
+        fi
+    done
+    check_end
+}
+
+do_zfs_dedup() {
+    check_begin zfs.dedup "$(check_title zfs.dedup)"
+    if ! have zpool; then
+        skip "zpool not available"
+        check_end
+        return 0
+    fi
+    if (( ${#PH_POOLS[@]} == 0 )); then
+        skip "no ZFS pool detected"
+        check_end
+        return 0
+    fi
+    local pool dedup dratio
+    for pool in "${PH_POOLS[@]}"; do
+        dedup=$(zpool get -H -o value dedup "$pool" 2>/dev/null)
+        dratio=$(zpool get -H -o value dedupratio "$pool" 2>/dev/null)
+        metric "$pool dedup" "${dedup:-N/A}"
+        metric "$pool dedupratio" "${dratio:-N/A}"
+        if [[ $dedup == on ]]; then
+            warn "dedup is enabled on pool $pool (high memory cost)"
+        fi
+    done
+    ok "dedup properties read"
+    check_end
+}
+
+do_zfs_iostat() {
+    check_begin zfs.iostat "$(check_title zfs.iostat)"
+    if ! have zpool; then
+        skip "zpool not available"
+        check_end
+        return 0
+    fi
+    if (( ${#PH_POOLS[@]} == 0 )); then
+        skip "no ZFS pool detected"
+        check_end
+        return 0
+    fi
+    local pool
+    for pool in "${PH_POOLS[@]}"; do
+        subhead "zpool iostat -v $pool (${PH_IO_SAMPLES} samples)"
+        zpool iostat -v "$pool" 1 "$PH_IO_SAMPLES" 2>/dev/null | raw
+    done
+    ok "I/O sampling completed"
+    check_end
+}
+
+# ---------------------------------------------------------------------------
+# Checks: storage
+# ---------------------------------------------------------------------------
+do_storage_smart() {
+    check_begin storage.smart "$(check_title storage.smart)"
+    if ! have smartctl; then
+        skip "smartctl not installed"
+        check_end
+        return 0
+    fi
+
+    # Collect unique disks across all pools.
+    declare -A seen=()
+    local pool dev real pct_used wear realloc poh temp spare
+    for pool in "${PH_POOLS[@]}"; do
+        while IFS= read -r dev; do
+            [[ -z $dev ]] && continue
+            real=$(disk_real "$dev")
+            [[ -n ${seen[$real]:-} ]] && continue
+            seen["$real"]=1
+            subhead "device: $real"
+            local out=""
+            if have smartctl; then
+                out=$(smartctl -a -d auto "$real" 2>/dev/null || true)
+                [[ -z $out ]] && out=$(smartctl -a "$real" 2>/dev/null || true)
+            fi
+            if [[ -z $out ]]; then
+                info "no SMART data for $real (need root or unsupported device)"
+                continue
+            fi
+
+            pct_used=$(printf '%s\n' "$out" | awk -F: '/Percentage Used/{gsub(/[^0-9]/, "", $2); print $2; exit}')
+            spare=$(printf '%s\n' "$out" | awk -F: '/Available Spare:/{gsub(/[^0-9]/, "", $2); print $2; exit}')
+            wear=$(printf '%s\n' "$out" | awk '/^ *[0-9]+ +(Wear_Leveling_Count|Media_Wearout_Indicat)/{print $4; exit}')
+            realloc=$(printf '%s\n' "$out" | awk '/^ *[0-9]+ +Reallocated_Sector_Ct/{print $NF; exit}')
+            poh=$(printf '%s\n' "$out" | awk -F: '/Power On Hours:/{gsub(/[^0-9]/, "", $2); print $2; exit}')
+            [[ -z $poh ]] && poh=$(printf '%s\n' "$out" | awk '/^ *[0-9]+ +Power_On_Hours/{print $NF; exit}')
+            temp=$(printf '%s\n' "$out" | awk -F: '/^Temperature:/{gsub(/[^0-9]/, "", $2); print $2; exit}')
+            [[ -z $temp ]] && temp=$(printf '%s\n' "$out" | awk -F: '/Current Temperature:/{gsub(/[^0-9]/, "", $2); print $2; exit}')
+            [[ -z $temp ]] && temp=$(printf '%s\n' "$out" | awk '/^ *[0-9]+ +Temperature_Celsius/{print $NF; exit}')
+
+            metric "Power-on hours" "${poh:-N/A}"
+            metric "Temperature (C)" "${temp:-N/A}"
+            [[ -n $pct_used ]] && metric "NVMe percentage used (%)" "$pct_used"
+            [[ -n $wear ]] && metric "Wear (remaining %)" "$wear"
+            [[ -n $realloc ]] && metric "Reallocated sectors" "$realloc"
+            [[ -n $spare ]] && metric "Available spare (%)" "$spare"
+
+            if is_number "${pct_used:-}" && ge "$pct_used" "$PH_THRESH_SSD_WEAR_WARN"; then
+                warn "$real: NVMe wear ${pct_used}% >= ${PH_THRESH_SSD_WEAR_WARN}%"
+            fi
+            if is_number "${wear:-}" && lt "$wear" "$((100 - PH_THRESH_SSD_WEAR_WARN))"; then
+                warn "$real: SSD remaining life ${wear}% below threshold"
+            fi
+            if is_number "${realloc:-}" && gt "$realloc" "$PH_THRESH_REALLOC_WARN"; then
+                warn "$real: ${realloc} reallocated sector(s)"
+            fi
+            if is_number "${temp:-}" && ge "$temp" "$PH_THRESH_TEMP_CRIT"; then
+                crit "$real: temperature ${temp}C >= ${PH_THRESH_TEMP_CRIT}C"
+            elif is_number "${temp:-}" && ge "$temp" "$PH_THRESH_TEMP_WARN"; then
+                warn "$real: temperature ${temp}C >= ${PH_THRESH_TEMP_WARN}C"
+            fi
+        done < <(pool_leaf_devices "$pool")
+    done
+
+    if (( ${#seen[@]} == 0 )); then
+        skip "no disks discovered in the selected pools"
+    else
+        ok "SMART data collected for ${#seen[@]} device(s)"
+    fi
+    check_end
+}
+
+# ---------------------------------------------------------------------------
+# Checks: VM / CT
+# ---------------------------------------------------------------------------
+do_vm_overcommit() {
+    check_begin vm.overcommit "$(check_title vm.overcommit)"
+    if (( ${#PH_GUEST_ID[@]} == 0 )); then
+        skip "no VM/CT detected"
+        check_end
+        return 0
+    fi
+
+    local total_cores total_ram vcpu_sum ram_sum i type id name st cfg cores sockets ram vcpu
+    total_cores=$(nproc 2>/dev/null || echo 0)
+    total_ram=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+    total_ram=${total_ram:-0}
+    metric "Physical cores" "$total_cores"
+    metric "Physical RAM (MiB)" "$total_ram"
+
+    _emit ""
+    _emit "$(printf '%-6s %-8s %-22s %-6s %-10s %-10s' 'VMID' 'TYPE' 'NAME' 'vCPU' 'RAM(MiB)' 'STATUS')"
+    vcpu_sum=0; ram_sum=0
+    for i in "${!PH_GUEST_ID[@]}"; do
+        type="${PH_GUEST_TYPE[$i]}"; id="${PH_GUEST_ID[$i]}"
+        name="${PH_GUEST_NAME[$i]}"; st="${PH_GUEST_STATUS[$i]}"
+        cfg=$(guest_config "$type" "$id")
+        if [[ $type == qemu ]]; then
+            cores=$(conf_field "$cfg" cores); cores=${cores:-1}
+            sockets=$(conf_field "$cfg" sockets); sockets=${sockets:-1}
+            vcpu=$((cores * sockets))
+        else
+            cores=$(conf_field "$cfg" cores); cores=${cores:-1}
+            vcpu=$cores
+        fi
+        ram=$(conf_field "$cfg" memory); ram=${ram:-0}
+        vcpu_sum=$((vcpu_sum + vcpu))
+        ram_sum=$((ram_sum + ram))
+        _emit "$(printf '%-6s %-8s %-22s %-6s %-10s %-10s' "$id" "$type" "${name:0:22}" "$vcpu" "$ram" "$st")"
+    done
+
+    local vcpu_ratio ram_ratio
+    vcpu_ratio=$(ratio_of "$vcpu_sum" "$total_cores")
+    ram_ratio=$(ratio_of "$ram_sum" "$total_ram")
+    _emit ""
+    metric "vCPU allocated" "$vcpu_sum (ratio ${vcpu_ratio}x)"
+    metric "RAM allocated (MiB)" "$ram_sum (ratio ${ram_ratio}x)"
+
+    if is_number "$vcpu_ratio" && gt "$vcpu_ratio" "$PH_THRESH_VCPU_OVERCOMMIT_WARN"; then
+        warn "vCPU overcommit ${vcpu_ratio}x > ${PH_THRESH_VCPU_OVERCOMMIT_WARN}x"
+    fi
+    if is_number "$ram_ratio" && gt "$ram_ratio" "$PH_THRESH_RAM_OVERCOMMIT_WARN"; then
+        warn "RAM overcommit ${ram_ratio}x > ${PH_THRESH_RAM_OVERCOMMIT_WARN}x (swap/OOM risk)"
+    fi
+    if is_number "$vcpu_ratio" && is_number "$ram_ratio" \
+       && ! gt "$vcpu_ratio" "$PH_THRESH_VCPU_OVERCOMMIT_WARN" \
+       && ! gt "$ram_ratio" "$PH_THRESH_RAM_OVERCOMMIT_WARN"; then
+        ok "resource allocation within thresholds"
+    fi
+    check_end
+}
+
+do_vm_usage() {
+    check_begin vm.usage "$(check_title vm.usage)"
+    if ! have pvesh; then
+        skip "pvesh not available"
+        check_end
+        return 0
+    fi
+    if (( ${#PH_GUEST_ID[@]} == 0 )); then
+        skip "no VM/CT detected"
+        check_end
+        return 0
+    fi
+
+    _emit ""
+    _emit "$(printf '%-6s %-8s %-22s %-8s %-10s %-12s %-12s' 'VMID' 'TYPE' 'NAME' 'STATUS' '%CPU' 'MEM(MiB)' 'MEM%')"
+    local i type id name st data cpu mem maxmem mem_mb max_mb cpu_pct mem_pct
+    for i in "${!PH_GUEST_ID[@]}"; do
+        type="${PH_GUEST_TYPE[$i]}"; id="${PH_GUEST_ID[$i]}"
+        name="${PH_GUEST_NAME[$i]}"; st="${PH_GUEST_STATUS[$i]}"
+        [[ $st != running ]] && continue
+        data=$(pvesh get "/nodes/${PH_NODE}/${type}/${id}/status/current" --output-format json 2>/dev/null || true)
+        [[ -z $data ]] && continue
+        name=$(json_get "$data" name); name=${name:-${PH_GUEST_NAME[$i]}}
+        cpu=$(json_get "$data" cpu)
+        mem=$(json_get "$data" mem)
+        maxmem=$(json_get "$data" maxmem)
+        cpu_pct="N/A"; mem_pct="N/A"; mem_mb="N/A"; max_mb="N/A"
+        if is_number "${cpu:-}"; then cpu_pct=$(awk -v v="$cpu" 'BEGIN{printf "%.1f", v*100}'); fi
+        if is_number "${mem:-}" && is_number "${maxmem:-}" && gt "$maxmem" 0; then
+            mem_mb=$((mem / 1024 / 1024)); max_mb=$((maxmem / 1024 / 1024))
+            mem_pct=$(pct_of "$mem" "$maxmem")
+        fi
+        _emit "$(printf '%-6s %-8s %-22s %-8s %-10s %-12s %-12s' \
+            "$id" "$type" "${name:0:22}" "$st" "${cpu_pct}%" "${mem_mb}/${max_mb}" "${mem_pct}%")"
+    done
+    _emit ""
+    info "note: %CPU is a fraction of one host core (50 = half core, 200 = 2 cores)"
+    ok "real usage sampled for running guests"
+    check_end
+}
+
+# ---------------------------------------------------------------------------
+# Checks: network
+# ---------------------------------------------------------------------------
+discover_bridges() {
+    local br
+    declare -A bset=()
+    if have ip; then
+        while IFS= read -r br; do
+            [[ -n $br ]] && bset["$br"]=1
+        done < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1)
+    fi
+    if [[ -r $PH_NET_INTERFACES ]]; then
+        while IFS= read -r br; do
+            [[ -n $br ]] && bset["$br"]=1
+        done < <(awk '$1 == "iface" && $2 ~ /^vmbr?[0-9]/ {print $2}' "$PH_NET_INTERFACES" 2>/dev/null)
+    fi
+    printf '%s\n' "${!bset[@]}" | sort
+}
+
+do_net_bridges() {
+    check_begin net.bridges "$(check_title net.bridges)"
+    if ! have ip && [[ ! -r $PH_NET_INTERFACES ]]; then
+        skip "neither 'ip' nor ${PH_NET_INTERFACES} available"
+        check_end
+        return 0
+    fi
+
+    local bridges=()
+    while IFS= read -r br; do
+        [[ -n $br ]] && bridges+=("$br")
+    done < <(discover_bridges)
+
+    if (( ${#bridges[@]} == 0 )); then
+        skip "no network bridge detected"
+        check_end
+        return 0
+    fi
+
+    local br state addr members
+    for br in "${bridges[@]}"; do
+        subhead "bridge: $br"
+        state="unknown"; addr=""; members=""
+        if have ip; then
+            state=$(ip -br link show "$br" 2>/dev/null | awk '{print $2}')
+            state=${state:-unknown}
+            addr=$(ip -br addr show "$br" 2>/dev/null | awk 'NR==1{$1=$2=""; sub(/^ +/, ""); print}')
+            members=$(ip -o link show master "$br" 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | paste -sd, -)
+        fi
+        metric "State" "$state"
+        metric "Addresses" "${addr:-none}"
+        metric "Member interfaces" "${members:-none}"
+        if [[ $state == UP ]]; then
+            ok "bridge $br is UP"
+        elif [[ $state == UNKNOWN || -z $state ]]; then
+            warn "bridge $br state unknown"
+        else
+            warn "bridge $br is $state"
+        fi
+    done
+    check_end
+}
+
+# ---------------------------------------------------------------------------
+# Checks: hardware
+# ---------------------------------------------------------------------------
+do_hardware_sensors() {
+    check_begin hardware.sensors "$(check_title hardware.sensors)"
+    if have sensors; then
+        subhead "lm-sensors"
+        sensors 2>/dev/null | raw
+    else
+        info "lm-sensors (sensors) not installed"
+    fi
+    if have ipmitool; then
+        subhead "IPMI"
+        ipmitool sensor 2>/dev/null | grep -iE "temp|fan|cpu|mb" | raw
+    else
+        info "ipmitool not installed"
+    fi
+    ok "sensor data collected"
+    check_end
+}
+
+# ---------------------------------------------------------------------------
+# Checks: backup / replication (only when present)
+# ---------------------------------------------------------------------------
+do_backup_status() {
+    check_begin backup.status "$(check_title backup.status)"
+    if ! have pvesh; then
+        skip "pvesh not available"
+        check_end
+        return 0
+    fi
+
+    local jobs=""
+    jobs=$(pvesh get /cluster/backup --output-format json 2>/dev/null || true)
+    if [[ -z $jobs || $jobs == "[]" || $jobs == "{}" ]]; then
+        if [[ ! -f /etc/pve/vzdump.cron ]]; then
+            skip "no backup job configured"
+            check_end
+            return 0
+        fi
+    fi
+
+    local tasks
+    tasks=$(pvesh get "/nodes/${PH_NODE}/tasks" --typefilter vzdump --limit 50 --output-format json 2>/dev/null || true)
+    if [[ -z $tasks || $tasks == "[]" ]]; then
+        info "no recent vzdump task found for node ${PH_NODE}"
+        check_end
+        return 0
+    fi
+
+    _emit ""
+    _emit "$(printf '%-6s %-20s %-10s %s' 'VMID' 'DATE' 'STATUS' 'UPID')"
+    local obj vmid status starttime date_str failures
+    failures=0
+    while IFS= read -r obj; do
+        [[ -z $obj ]] && continue
+        vmid=$(json_get "$obj" id)
+        status=$(json_get "$obj" status)
+        starttime=$(json_get "$obj" starttime)
+        date_str="?"
+        if is_number "${starttime:-}"; then
+            date_str=$(date -d "@${starttime}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")
+        fi
+        _emit "$(printf '%-6s %-20s %-10s %s' "${vmid:-?}" "$date_str" "${status:-?}" "-")"
+        if [[ -n $status && $status != OK ]]; then
+            failures=$((failures + 1))
+        fi
+    done < <(printf '%s' "$tasks" | json_lines)
+
+    _emit ""
+    if (( failures > 0 )); then
+        warn "${failures} recent vzdump task(s) did not finish OK"
+    else
+        ok "recent vzdump tasks completed successfully"
+    fi
+    check_end
+}
+
+do_replication_status() {
+    check_begin replication.status "$(check_title replication.status)"
+    if ! have pvesr; then
+        skip "pvesr not available (single node or no replication tooling)"
+        check_end
+        return 0
+    fi
+    local out
+    out=$(pvesr status 2>/dev/null || true)
+    if [[ -z $out ]]; then
+        skip "no replication job configured"
+        check_end
+        return 0
+    fi
+    printf '%s\n' "$out" | raw
+    if printf '%s\n' "$out" | grep -qiE 'fail|error'; then
+        warn "at least one replication job reports a failure"
+    else
+        ok "no replication failure detected"
+    fi
+    check_end
+}
+
+# ---------------------------------------------------------------------------
+# Check runner
+# ---------------------------------------------------------------------------
+run_check() {
+    case $1 in
+        host.resources)      do_host_resources ;;
+        host.systemd)        do_host_systemd ;;
+        zfs.pool_health)     do_zfs_pool_health ;;
+        zfs.datasets)        do_zfs_datasets ;;
+        zfs.arc)             do_zfs_arc ;;
+        zfs.trim)            do_zfs_trim ;;
+        zfs.dedup)           do_zfs_dedup ;;
+        zfs.iostat)          do_zfs_iostat ;;
+        storage.smart)       do_storage_smart ;;
+        vm.overcommit)       do_vm_overcommit ;;
+        vm.usage)            do_vm_usage ;;
+        net.bridges)         do_net_bridges ;;
+        hardware.sensors)    do_hardware_sensors ;;
+        backup.status)       do_backup_status ;;
+        replication.status)  do_replication_status ;;
+        *)                   err "unknown check: $1" ;;
+    esac
+}
+
+select_checks() {
+    CHECKS=()
+    if [[ -z $PH_SELECT ]]; then
+        CHECKS=("${CHECKS_ALL[@]}")
+        return 0
+    fi
+    local item id found
+    for item in ${PH_SELECT//,/ }; do
+        found=0
+        for id in "${CHECKS_ALL[@]}"; do
+            if [[ $id == "$item" ]]; then
+                CHECKS+=("$item"); found=1; break
+            fi
+        done
+        if (( found == 0 )); then
+            err "unknown check: $item"
+            err "use --list-checks to see the available ids"
+            return 2
+        fi
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+print_header() {
+    _emit "$(printf '%s v%s' "$PH_PROG" "$PH_VERSION")" "$C_BOLD"
+    metric "Date" "$(date '+%Y-%m-%d %H:%M:%S %z')"
+    metric "Node" "$PH_NODE"
+    metric "Proxmox VE" "$(pve_version)"
+    metric "Kernel" "$(uname -sr 2>/dev/null || echo unknown)"
+    if (( ${#PH_POOLS[@]} > 0 )); then
+        metric "ZFS pools" "${PH_POOLS[*]}"
+    else
+        metric "ZFS pools" "none detected"
+    fi
+    if (( ${#PH_GUEST_ID[@]} > 0 )); then
+        metric "Guests" "${#PH_GUEST_ID[@]} (VMs + CTs)"
+    else
+        metric "Guests" "none detected"
+    fi
+}
+
+print_summary() {
+    local line="=================================================================="
+    _emit_force ""
+    _emit_force "$line" "$C_BOLD"
+    _emit_force "Summary"
+    _emit_force "$line" "$C_BOLD"
+
+    local id status sev ok_n=0 warn_n=0 crit_n=0 skip_n=0
+    for id in "${CHECKS[@]}"; do
+        sev="${CK_SEV[$id]:-0}"
+        if [[ "${CK_STATUS[$id]:-ok}" == skip ]]; then
+            status="SKIPPED"; skip_n=$((skip_n + 1))
+        elif (( sev >= 2 )); then
+            status="CRITICAL"; crit_n=$((crit_n + 1))
+        elif (( sev == 1 )); then
+            status="WARNING"; warn_n=$((warn_n + 1))
+        else
+            status="OK"; ok_n=$((ok_n + 1))
+        fi
+        _emit_force "$(printf '  %-22s %s' "$id" "$status")" "$(status_color "$status")"
+    done
+    _emit_force ""
+    _emit_force "$(printf '  checks: %d OK, %d WARNING, %d CRITICAL, %d SKIPPED' \
+        "$ok_n" "$warn_n" "$crit_n" "$skip_n")"
+
+    # Findings that need attention.
+    if (( warn_n + crit_n > 0 )); then
+        _emit_force ""
+        _emit_force "Findings:" "$C_BOLD"
+        local finding
+        for id in "${CHECKS[@]}"; do
+            while IFS= read -r finding; do
+                [[ -z $finding ]] && continue
+                case ${finding%%|*} in
+                    warn) _emit_force "  [WARN] ${id}: ${finding#*|}" "$C_YELLOW" ;;
+                    crit) _emit_force "  [CRIT] ${id}: ${finding#*|}" "$C_RED" ;;
+                esac
+            done <<<"${CK_FINDINGS[$id]:-}"
+        done
+    fi
+
+    _emit_force ""
+    if (( PH_STATUS == 0 )); then
+        _emit_force "Overall status: OK" "$C_GREEN"
+    elif (( PH_STATUS == 1 )); then
+        _emit_force "Overall status: WARNING" "$C_YELLOW"
+    else
+        _emit_force "Overall status: CRITICAL" "$C_RED"
+    fi
+    if [[ -n $PH_OUTPUT ]]; then
+        _emit_force "Report written to: $PH_OUTPUT"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+load_config() {
+    local cfg="$PH_CONFIG"
+    if [[ -n $cfg && -r $cfg ]]; then
+        # shellcheck source=/dev/null
+        source "$cfg"
+    fi
+}
+
+apply_env_overrides() {
+    local line k v
+    while IFS= read -r line; do
+        k="${line%%=*}"
+        v="${line#*=}"
+        case $k in
+            PH_*) printf -v "$k" '%s' "$v" ;;
+        esac
+    done < <(env 2>/dev/null)
+}
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+ARG_SELECT=""; ARG_POOL=""; ARG_NODE=""; ARG_OUTPUT=""; ARG_NO_COLOR=""
+ARG_QUIET=""; ARG_CONFIG=""; MODE="run"
+
+usage() {
+    cat <<EOF
+$PH_PROG v$PH_VERSION - Proxmox VE diagnostics and integrity checks
+
+Usage: $PH_PROG [options]
+
+Options:
+  -c, --check ID[,ID...]   run only the given checks (see --list-checks)
+      --pool NAME[,NAME]   restrict ZFS checks to these pools
+      --node NAME          Proxmox node name (default: auto-detect)
+  -o, --output FILE        also write the report to FILE
+      --no-color           disable colored output (also honours NO_COLOR)
+  -q, --quiet              print only the final summary
+      --config FILE        configuration file (default: $PH_CONFIG)
+      --list-checks        list the available check ids and exit
+  -v, --version            print version and exit
+  -h, --help               show this help and exit
+
+Exit codes: 0 = OK, 1 = WARNING or CRITICAL, 2 = usage/setup error
+
+Examples:
+  $PH_PROG
+  $PH_PROG -c zfs.pool_health,storage.smart --pool rpool
+  $PH_PROG -o /var/tmp/pve-report.txt --no-color
+EOF
+}
+
+parse_args() {
+    while (( $# )); do
+        case $1 in
+            -c|--check)   ARG_SELECT="${ARG_SELECT:+$ARG_SELECT,}${2:?missing value for $1}"; shift 2 ;;
+            --check=*)    ARG_SELECT="${ARG_SELECT:+$ARG_SELECT,}${1#*=}"; shift ;;
+            --pool)       ARG_POOL="${2:?missing value for $1}"; shift 2 ;;
+            --pool=*)     ARG_POOL="${1#*=}"; shift ;;
+            --node)       ARG_NODE="${2:?missing value for $1}"; shift 2 ;;
+            --node=*)     ARG_NODE="${1#*=}"; shift ;;
+            -o|--output)  ARG_OUTPUT="${2:?missing value for $1}"; shift 2 ;;
+            --output=*)   ARG_OUTPUT="${1#*=}"; shift ;;
+            --config)     ARG_CONFIG="${2:?missing value for $1}"; shift 2 ;;
+            --config=*)   ARG_CONFIG="${1#*=}"; shift ;;
+            --no-color)   ARG_NO_COLOR=1; shift ;;
+            -q|--quiet)   ARG_QUIET=1; shift ;;
+            --list-checks) MODE="list"; shift ;;
+            -v|--version)  MODE="version"; shift ;;
+            -h|--help)     MODE="help"; shift ;;
+            --)           shift; break ;;
+            *)            err "unknown option: $1"; usage >&2; exit 2 ;;
+        esac
+    done
+}
+
+apply_cli() {
+    [[ -n $ARG_SELECT ]]   && PH_SELECT="$ARG_SELECT"
+    [[ -n $ARG_POOL ]]     && PH_POOL_OPT="$ARG_POOL"
+    [[ -n $ARG_NODE ]]     && PH_NODE="$ARG_NODE"
+    [[ -n $ARG_OUTPUT ]]   && PH_OUTPUT="$ARG_OUTPUT"
+    [[ -n $ARG_CONFIG ]]   && PH_CONFIG="$ARG_CONFIG"
+    [[ -n $ARG_NO_COLOR ]] && PH_NO_COLOR="$ARG_NO_COLOR"
+    [[ -n $ARG_QUIET ]]    && PH_QUIET="$ARG_QUIET"
+}
+
+open_output() {
+    if [[ -n $PH_OUTPUT ]]; then
+        if ! : >"$PH_OUTPUT" 2>/dev/null; then
+            err "cannot write to output file: $PH_OUTPUT"
+            exit 2
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+    parse_args "$@"
+
+    case $MODE in
+        help)    usage; exit 0 ;;
+        version) echo "$PH_PROG v$PH_VERSION"; exit 0 ;;
+        list)
+            local id
+            for id in "${CHECKS_ALL[@]}"; do
+                printf '%-22s %s\n' "$id" "$(check_title "$id")"
+            done
+            exit 0 ;;
+    esac
+
+    # Defaults already set; config file first, then environment, then CLI.
+    load_config
+    apply_env_overrides
+    apply_cli
+
+    setup_colors
+    open_output
+
+    if ! select_checks; then
+        exit 2
+    fi
+    TOTAL_SELECTED=${#CHECKS[@]}
+
+    detect_node
+    discover_pools
+    discover_guests
+
+    print_header
+    local id
+    for id in "${CHECKS[@]}"; do
+        run_check "$id"
+    done
+    print_summary
+
+    if (( PH_STATUS > 0 )); then
+        exit 1
+    fi
+    exit 0
+}
+
+main "$@"

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  *"/cluster/backup"*) echo "[]" ;;
+  *"/tasks"*)          echo "[]" ;;
+  *"/qemu/100/status/current"*) echo '{"name":"web01","status":"running","cpu":0.25,"mem":536870912,"maxmem":2147483648}' ;;
+  *"/lxc/200/status/current"*)  echo '{"name":"ct01","status":"running","cpu":0.10,"mem":134217728,"maxmem":536870912}' ;;
+  *) echo "{}" ;;
+esac

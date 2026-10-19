@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+case "$*" in
+  list) cat <<'OUT'
+VMID       Status     Lock         Name
+200        running                 ct01
+OUT
+    ;;
+  "status 200") echo "status: running" ;;
+  "config 200") cat <<'OUT'
+cores: 1
+memory: 512
+hostname: ct01
+OUT
+    ;;
+  *) exit 0 ;;
+esac

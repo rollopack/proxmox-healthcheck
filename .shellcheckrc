@@ -1,0 +1,6 @@
+# ShellCheck configuration for proxmox-healthcheck.
+#
+# The project targets Proxmox VE / Debian with bash 5.x, so we can rely on
+# modern bash features. Keep the linter strict.
+severity=style
+external-sources=true

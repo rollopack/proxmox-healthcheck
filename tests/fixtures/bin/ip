@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  *"link show type bridge"*) echo "3: vmbr0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500" ;;
+  *"br link show vmbr0"*)    echo "vmbr0             UP             00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>" ;;
+  *"br addr show vmbr0"*)    echo "vmbr0             UP             192.168.1.1/24 fe80::1/64" ;;
+  *"link show master vmbr0"*) echo "4: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500" ;;
+  *) exit 0 ;;
+esac

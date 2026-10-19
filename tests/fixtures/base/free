@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+case "${1:-}" in
+  -h)
+    cat <<'OUT'
+              total        used        free      shared  buff/cache   available
+Mem:           15Gi       4.0Gi       9.0Gi       0.1Gi       2.0Gi        10Gi
+Swap:         8.0Gi          0B       8.0Gi
+OUT
+    ;;
+  *)
+    cat <<'OUT'
+              total        used        free      shared  buff/cache   available
+Mem:          15800        4000       11200         100        2000       10500
+Swap:          8000           0        8000
+OUT
+    ;;
+esac

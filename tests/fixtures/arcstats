@@ -1,0 +1,6 @@
+name                            type data
+hits                            4    900
+misses                          4    100
+size                            4    1073741824
+c_max                           4    2147483648
+c_min                           4    536870912

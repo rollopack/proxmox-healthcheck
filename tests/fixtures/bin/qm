@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+case "$*" in
+  list) cat <<'OUT'
+ VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
+ 100  web01                running    2048              32.00 1000
+ 101  db01                 stopped    4096              64.00 0
+OUT
+    ;;
+  "status 100") echo "status: running" ;;
+  "status 101") echo "status: stopped" ;;
+  "config 100") cat <<'OUT'
+cores: 2
+sockets: 1
+memory: 2048
+name: web01
+OUT
+    ;;
+  "config 101") cat <<'OUT'
+cores: 4
+sockets: 2
+memory: 4096
+name: db01
+OUT
+    ;;
+  *) exit 0 ;;
+esac

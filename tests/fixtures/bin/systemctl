@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+case "$*" in
+  *--failed*) exit 0 ;;
+  *is-enabled*) exit 1 ;;
+  *) exit 0 ;;
+esac

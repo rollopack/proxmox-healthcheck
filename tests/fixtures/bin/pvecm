@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+case "$*" in
+  status) echo "Name: testnode" ;;
+  *) exit 0 ;;
+esac

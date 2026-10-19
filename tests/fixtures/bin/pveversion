@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo "pve-manager/8.2.2/abcdef0123456789"

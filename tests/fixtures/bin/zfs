@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+case "$*" in
+  "list -t volume"*) cat <<'OUT'
+NAME                     USED  AVAIL  REFRESERV  VOLSIZE
+rpool/data/vm-100-disk-0  2G    20G         -        32G
+OUT
+    ;;
+  "list -r"*) cat <<'OUT'
+NAME                 USED  AVAIL  REFER  RATIO  COMPRESSRATIO
+rpool                5.0G   20G    1.0M   1.00           1.00
+rpool/data           4.0G   20G    4.0G   1.00           1.50
+OUT
+    ;;
+  "get -H -o value org.debian:periodic-trim"*) echo "auto" ;;
+  *) exit 0 ;;
+esac

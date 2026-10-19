@@ -1,0 +1,31 @@
+# proxmox-healthcheck - git ignore rules
+
+# --- OS noise -------------------------------------------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- Editors / IDEs -------------------------------------------------------
+*.swp
+*.swo
+*.bak
+*~
+.idea/
+.vscode/
+*.project
+.settings/
+
+# --- Local configuration (never commit machine-specific settings) ---------
+proxmox-healthcheck.conf
+*.local
+
+# --- Generated reports (produced with -o FILE) ----------------------------
+report_*.txt
+pve-report*.txt
+*.report
+/reports/
+
+# --- Local tooling artifacts ----------------------------------------------
+shellcheck-*.tar.xz
+shellcheck-v*/

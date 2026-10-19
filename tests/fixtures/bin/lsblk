@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+case "$*" in
+  *PKNAME*) : ;;
+  *TRAN*)   echo "sata" ;;
+  *)        : ;;
+esac

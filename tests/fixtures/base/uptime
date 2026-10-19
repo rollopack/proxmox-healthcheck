@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo " 08:00:00 up 1 day,  1 user,  load average: 0.10, 0.20, 0.30"
