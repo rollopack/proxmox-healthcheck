@@ -142,9 +142,10 @@ check warns when a guest has no successful task in the inspected history, when
 its latest successful backup is at least `PH_THRESH_BACKUP_AGE_DAYS` days old,
 or when the most recent task that included it did not finish `OK`. It inspects
 the most recent `PH_BACKUP_TASK_HISTORY` tasks (default 30).
-When exactly one configured job lists its guests in the task-log command line,
-the scan stops once every selected guest has a known successful backup; older
-logs cannot change freshness or the latest-task result.
+When exactly one configured job lists explicit guest IDs, the scan stops once
+each selected guest has a known successful backup. For an all-guest job
+(`all: 1` / `--all 1`), it stops after a successful task whose log lists guests
+and ends with `TASK OK`. Otherwise it continues through the configured history.
 
 If no task log can be read, the guest id is taken from the task `id` field when
 Proxmox provides one; otherwise the check falls back to the freshness of the

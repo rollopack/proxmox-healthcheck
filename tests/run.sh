@@ -359,6 +359,21 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+scenario "backup.status stops after a successful --all backup job"
+PH_TEST_BACKUP=all
+make_bin; add_proxmox
+: >"$SANDBOX/log_calls"
+run -c backup.status
+assert_rc 0
+assert_contains "100 Windows-11"
+assert_contains "101 mailserver.example.test"
+if [ "$(wc -l <"$SANDBOX/log_calls")" -eq 1 ]; then
+    t_pass "read only the latest --all task log"
+else
+    t_fail "expected 1 task log read, got $(wc -l <"$SANDBOX/log_calls")"
+fi
+
+# ---------------------------------------------------------------------------
 scenario "backup.status accepts a whitespace-formatted empty job list"
 PH_TEST_BACKUP=empty-pretty
 make_bin; add_proxmox

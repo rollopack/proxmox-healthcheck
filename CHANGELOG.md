@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - 2026-10-21
+
+### Fixed
+
+- Recognize Proxmox all-guest backup jobs (`all: 1` / `--all 1`) so a complete
+  successful task can stop the history scan without explicit positional VMIDs.
+
 ## [0.1.3] - 2026-10-21
 
 ### Fixed
@@ -19,8 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Performance
 
-- Stop scanning older task logs once the sole configured job's selected guests
-  all have known successful backups, avoiding redundant log requests.
+- Stop scanning older task logs once a successful task covers all explicitly
+  selected guests, avoiding redundant log requests.
 
 ### Added
 

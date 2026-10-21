@@ -20,6 +20,7 @@ case "$args" in
     case "${PH_TEST_BACKUP:-empty}" in
       empty) echo '[]' ;;
       empty-pretty) printf '[\n  ]\n' ;;
+      all) echo '[{"id":"backup-job","all":1}]' ;;
       *) echo '[{"id":"backup-job"}]' ;;
     esac
     ;;
@@ -83,6 +84,15 @@ OUT
         stamp=$(date -d '1 day ago' +%s)
         oldstamp=$(date -d '2 days ago' +%s)
         printf '[\n { "id": "", "status": "OK", "starttime": %s, "upid": "UPID:node:quick" },\n' "$stamp"
+        for i in {2..30}; do
+          printf ' { "id": "", "status": "OK", "starttime": %s, "upid": "UPID:node:old-%s" }%s\n' "$oldstamp" "$i" "$([[ $i -lt 30 ]] && printf ',' || true)"
+        done
+        printf ']\n'
+        ;;
+      all)
+        stamp=$(date -d '1 day ago' +%s)
+        oldstamp=$(date -d '2 days ago' +%s)
+        printf '[\n { "id": "", "status": "OK", "starttime": %s, "upid": "UPID:node:all" },\n' "$stamp"
         for i in {2..30}; do
           printf ' { "id": "", "status": "OK", "starttime": %s, "upid": "UPID:node:old-%s" }%s\n' "$oldstamp" "$i" "$([[ $i -lt 30 ]] && printf ',' || true)"
         done

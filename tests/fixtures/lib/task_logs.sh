@@ -88,6 +88,18 @@ INFO: Finished Backup of VM 102 (00:00:15)
 TASK OK
 OUT
         ;;
+    all:UPID:node:all)
+        cat <<'OUT'
+INFO: starting new backup job: vzdump --mode suspend --quiet 1 --compress zstd --all 1 --storage NAS-NFS
+INFO: Starting Backup of VM 100 (qemu)
+INFO: VM Name: Windows-11
+INFO: Finished Backup of VM 100 (00:00:08)
+INFO: Starting Backup of VM 101 (qemu)
+INFO: VM Name: mailserver.example.test
+INFO: Finished Backup of VM 101 (00:00:15)
+TASK OK
+OUT
+        ;;
     paged:UPID:node:paged)
         cat <<'OUT'
 INFO: Starting Backup of VM 100 (qemu)
