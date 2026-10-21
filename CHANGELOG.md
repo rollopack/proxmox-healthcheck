@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-10-21
+
+### Fixed
+
+- Load the file passed to `--config` and fail clearly when that explicit path
+  is unreadable.
+- Parse formatted JSON with whitespace and multiline objects, including braces
+  inside quoted strings; report unavailable VM usage data instead of claiming
+  that sampling succeeded.
+- Check backup freshness per VM/CT using the latest successful task and warn
+  for stale or missing successes; an older failed task no longer overrides a
+  newer success.
+
+### Added
+
+- Optional host-wide SMART discovery with `PH_SMART_SCAN_ALL_DISKS=1` to include
+  `lsblk` disk devices outside ZFS pools.
+
 ## [0.1.1] - 2026-10-19
 
 ### Fixed
@@ -40,3 +58,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 [0.1.0]: https://github.com/rollopack/proxmox-healthcheck/releases/tag/v0.1.0
 [0.1.1]: https://github.com/rollopack/proxmox-healthcheck/releases/tag/v0.1.1
+[0.1.2]: https://github.com/rollopack/proxmox-healthcheck/releases/tag/v0.1.2

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 case "$*" in
+  *"NAME,TYPE"*) printf '/dev/sda disk\n/dev/sdb disk\n' ;;
   *PKNAME*) : ;;
   *TRAN*)   echo "sata" ;;
   *)        : ;;

@@ -62,6 +62,10 @@
 # maximum P/E count reaches PH_THRESH_SSD_WEAR_WARN% of the rating.
 # PH_THRESH_SSD_PE_CYCLES=0
 
+# Also run SMART checks on every physical disk reported by lsblk, including
+# disks that are not backing a ZFS pool. Default 0 checks only ZFS pool disks.
+# PH_SMART_SCAN_ALL_DISKS=0
+
 # Reallocated sectors (> warn).
 # PH_THRESH_REALLOC_WARN=0
 
@@ -69,5 +73,5 @@
 # PH_THRESH_TEMP_WARN=70
 # PH_THRESH_TEMP_CRIT=85
 
-# Age in days of the most recent backup task (informational threshold).
+# Maximum age in days of the latest successful vzdump per VM/CT (>= warn).
 # PH_THRESH_BACKUP_AGE_DAYS=7

@@ -13,9 +13,10 @@ error.
 
 ## Features
 
-- **Auto-discovery** – detects the pools from `zpool list -H -o name`, the
-  backing disks, the network bridges and every VM/CT with its state. No pool,
-  disk or guest name is hardcoded.
+- **Auto-discovery** – detects the pools from `zpool list -H -o name`, their
+  backing disks, the network bridges and every VM/CT with its state. Set
+  `PH_SMART_SCAN_ALL_DISKS=1` to include physical disks outside ZFS pools. No
+  pool, disk or guest name is hardcoded.
 - **Modular internals** – the checks only *record* results; a separate report
   layer prints them. Adding a check does not touch the output code.
 - **Graceful degradation** – missing `zpool`, `zfs`, `qm`, `pct`, `pvesh`,
@@ -155,6 +156,10 @@ Settings can be provided, from lowest to highest priority, by:
 See `proxmox-healthcheck.conf.example` for the full list, including every
 threshold (pool capacity, fragmentation, scrub age, overcommit, SSD wear,
 temperature, backup age, swap usage, ...).
+
+`--config FILE` loads the specified configuration file. SMART checks cover ZFS
+pool disks by default; set `PH_SMART_SCAN_ALL_DISKS=1` to include all physical
+disks reported by `lsblk`.
 
 ## Testing
 

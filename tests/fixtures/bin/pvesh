@@ -1,9 +1,58 @@
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
-  *"/cluster/backup"*) echo "[]" ;;
-  *"/tasks"*)          echo "[]" ;;
-  *"/qemu/100/status/current"*) echo '{"name":"web01","status":"running","cpu":0.25,"mem":536870912,"maxmem":2147483648}' ;;
-  *"/lxc/200/status/current"*)  echo '{"name":"ct01","status":"running","cpu":0.10,"mem":134217728,"maxmem":536870912}' ;;
+  *"/cluster/backup"*)
+    case "${PH_TEST_BACKUP:-empty}" in
+      empty) echo '[]' ;;
+      empty-pretty) printf '[\n  ]\n' ;;
+      *) echo '[{"id":"backup-job"}]' ;;
+    esac
+    ;;
+  *"/tasks"*)
+    case "${PH_TEST_BACKUP:-empty}" in
+      stale)
+        stamp=$(date -d '30 days ago' +%s)
+        cat <<OUT
+[
+  {
+    "id": "100",
+    "status": "OK",
+    "starttime": $stamp,
+    "upid": "UPID:node:one,},{two"
+  }
+]
+OUT
+        ;;
+      recent)
+        stamp=$(date -d '1 day ago' +%s)
+        oldstamp=$(date -d '2 days ago' +%s)
+        printf '[\n { "id": "100", "status": "OK", "starttime": %s },\n { "id": "200", "status": "OK", "starttime": %s },\n { "id": "100", "status": "ERROR", "starttime": %s }\n]\n' "$stamp" "$stamp" "$oldstamp"
+        ;;
+      failed)
+        stamp=$(date -d '1 day ago' +%s)
+        printf '[\n {"id":"100", "status" : "ERROR", "starttime": %s}\n]\n' "$stamp"
+        ;;
+      *) echo '[]' ;;
+    esac
+    ;;
+  *"/qemu/100/status/current"*)
+    if [[ ${PH_TEST_VM_JSON:-compact} == pretty ]]; then
+      cat <<'OUT'
+{
+  "name": "web01",
+  "status": "running",
+  "cpu": 0.25,
+  "mem": 536870912,
+  "maxmem": 2147483648
+}
+OUT
+    else
+      echo '{"name":"web01","status":"running","cpu":0.25,"mem":536870912,"maxmem":2147483648}'
+    fi
+    ;;
+  *"/lxc/200/status/current"*)
+    if [[ ${PH_TEST_VM_JSON:-compact} == pretty ]]; then exit 1; fi
+    echo '{"name":"ct01","status":"running","cpu":0.10,"mem":134217728,"maxmem":536870912}'
+    ;;
   *) echo "{}" ;;
 esac

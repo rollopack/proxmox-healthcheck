@@ -56,6 +56,10 @@ run() {
         PH_TEST_ERRORS="${PH_TEST_ERRORS:-No known data errors}" \
         PH_TEST_SMART="${PH_TEST_SMART:-sata-pe}" \
         PH_THRESH_SSD_PE_CYCLES="${PH_TEST_PE_RATING:-0}" \
+        PH_TEST_VM_JSON="${PH_TEST_VM_JSON:-compact}" \
+        PH_TEST_BACKUP="${PH_TEST_BACKUP:-empty}" \
+        PH_THRESH_BACKUP_AGE_DAYS="${PH_TEST_BACKUP_AGE_DAYS:-7}" \
+        PH_SMART_SCAN_ALL_DISKS="${PH_TEST_SMART_SCAN_ALL_DISKS:-0}" \
         "$BASH_BIN" "$SCRIPT" --no-color "$@" 2>&1)
     RC=$?
 }
@@ -136,6 +140,7 @@ assert_contains "Power-on hours"
 assert_matches "Temperature \\(C\\) +33$"
 assert_not_contains "23/51"
 assert_matches "Reallocated sectors +0"
+assert_not_contains "device: /dev/sdb"
 
 # ---------------------------------------------------------------------------
 scenario "storage.smart does not warn on a vendor indicator contradicted by P/E counters"
@@ -180,6 +185,14 @@ assert_rc 1
 assert_contains "SSD life used 90% >= 80%"
 
 # ---------------------------------------------------------------------------
+scenario "storage.smart optionally scans physical disks outside ZFS pools"
+PH_TEST_SMART=sata-pe; PH_TEST_PE_RATING=0; PH_TEST_SMART_SCAN_ALL_DISKS=1
+make_bin; add_proxmox
+run -c storage.smart
+assert_rc 0
+assert_contains "device: /dev/sdb"
+
+# ---------------------------------------------------------------------------
 scenario "no Proxmox/ZFS tooling present"
 make_bin
 run
@@ -200,6 +213,68 @@ make_bin
 run -c does.not.exist
 assert_rc 2
 assert_contains "unknown check"
+
+# ---------------------------------------------------------------------------
+scenario "--config loads the requested config before checks"
+make_bin; add_proxmox
+printf 'PH_THRESH_POOL_CAP_WARN=40\n' >"$SANDBOX/selected.conf"
+run -c zfs.pool_health --config "$SANDBOX/selected.conf"
+assert_rc 1
+assert_contains "capacity 42% >= 40%"
+
+# ---------------------------------------------------------------------------
+scenario "--config fails clearly when the requested file is missing"
+make_bin
+run --config "$SANDBOX/missing.conf"
+assert_rc 2
+assert_contains "configuration file is not readable"
+
+# ---------------------------------------------------------------------------
+scenario "vm.usage parses pretty JSON and reports missing guest data"
+PH_TEST_VM_JSON=pretty
+make_bin; add_proxmox
+run -c vm.usage
+assert_rc 1
+assert_contains "web01"
+assert_contains "25.0%"
+assert_contains "512/2048"
+assert_contains "could not retrieve usage for 1 guest(s)"
+
+# ---------------------------------------------------------------------------
+scenario "backup.status warns when the latest successful backup is stale"
+PH_TEST_BACKUP=stale
+make_bin; add_proxmox
+run -c backup.status
+assert_rc 1
+assert_contains "latest successful backup for"
+assert_contains "threshold"
+assert_contains "UPID:node:one,},{two"
+
+# ---------------------------------------------------------------------------
+scenario "backup.status accepts recent successful backup tasks"
+PH_TEST_BACKUP=recent
+make_bin; add_proxmox
+run -c backup.status
+assert_rc 0
+assert_contains "recent vzdump tasks completed successfully"
+assert_contains "200"
+assert_not_contains "did not finish OK"
+
+# ---------------------------------------------------------------------------
+scenario "backup.status warns when no successful backup task exists"
+PH_TEST_BACKUP=failed
+make_bin; add_proxmox
+run -c backup.status
+assert_rc 1
+assert_contains "no successful vzdump task found"
+
+# ---------------------------------------------------------------------------
+scenario "backup.status accepts a whitespace-formatted empty job list"
+PH_TEST_BACKUP=empty-pretty
+make_bin; add_proxmox
+run -c backup.status
+assert_rc 0
+assert_contains "no backup job configured"
 
 # ---------------------------------------------------------------------------
 printf '\n------------------------------\n'

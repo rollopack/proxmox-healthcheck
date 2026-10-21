@@ -78,6 +78,9 @@ For every unique disk backing the selected pools:
   - P/E cycle counters (`Maximum_PE_Cycles*`, `Average_PE_Cycles*`);
   - the vendor wear indicator (`Media_Wearout_Indicator`,
     `Wear_Leveling_Count`).
+- By default, SMART checks cover disks backing the selected ZFS pools. Set
+  `PH_SMART_SCAN_ALL_DISKS=1` to add all devices reported by `lsblk` as physical
+  disks, including disks outside ZFS pools.
 - WARNING sources, in order of precedence:
   1. NVMe percentage used at `PH_THRESH_SSD_WEAR_WARN`%;
   2. remaining-life attribute below `100 - PH_THRESH_SSD_WEAR_WARN`%;
@@ -107,7 +110,8 @@ resources. WARNING when the vCPU ratio exceeds
 
 Real CPU and memory usage of running guests via
 `pvesh get /nodes/<node>/<type>/<id>/status/current`. `%CPU` is a fraction of
-one host core. Skipped if `pvesh` is not available.
+one host core. WARNING when usage data cannot be retrieved for one or more
+running guests; skipped if `pvesh` is not available.
 
 ## net.bridges
 
@@ -124,9 +128,13 @@ are installed. Informational.
 ## backup.status
 
 Only runs when a backup job is configured (`/cluster/backup` or
-`/etc/pve/vzdump.cron`). Lists recent `vzdump` tasks and warns when at least
-one did not finish with `OK`. Skipped if `pvesh` is missing or no backup job
-exists.
+`/etc/pve/vzdump.cron`). Lists recent `vzdump` tasks, warns when a VM/CT's
+latest task did not finish with `OK`, when it has no successful task in the returned history,
+or when its latest successful backup is at least
+`PH_THRESH_BACKUP_AGE_DAYS` days old. Skipped if `pvesh` is missing or no backup
+job exists. The latest task status and freshness check are evaluated per VM/CT
+id represented in the returned task history (up to the most recent 50 tasks),
+so an older failed task does not override a newer successful task.
 
 ## replication.status
 
