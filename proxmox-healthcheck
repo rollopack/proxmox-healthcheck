@@ -22,7 +22,7 @@ set -uo pipefail
 export LC_ALL=C
 
 PH_PROG="proxmox-healthcheck"
-PH_VERSION="0.1.2"
+PH_VERSION="0.1.3"
 
 # ---------------------------------------------------------------------------
 # Defaults (overridden by: config file -> environment -> command line)
@@ -55,7 +55,11 @@ PH_THRESH_REALLOC_WARN="${PH_THRESH_REALLOC_WARN:-0}"      # reallocated sectors
 PH_THRESH_TEMP_WARN="${PH_THRESH_TEMP_WARN:-70}"
 PH_THRESH_TEMP_CRIT="${PH_THRESH_TEMP_CRIT:-85}"
 PH_THRESH_BACKUP_AGE_DAYS="${PH_THRESH_BACKUP_AGE_DAYS:-7}"
+PH_BACKUP_TASK_HISTORY="${PH_BACKUP_TASK_HISTORY:-30}"
 PH_SMART_SCAN_ALL_DISKS="${PH_SMART_SCAN_ALL_DISKS:-0}"
+# Internal tuning for task log retrieval (not user configuration).
+PH_BACKUP_LOG_CHUNK=1000
+PH_BACKUP_LOG_MAX_LINES=50000
 
 # ---------------------------------------------------------------------------
 # Colors
@@ -1185,6 +1189,155 @@ do_hardware_sensors() {
 # ---------------------------------------------------------------------------
 # Checks: backup / replication (only when present)
 # ---------------------------------------------------------------------------
+
+# Retrieve the full log of a Proxmox task.
+# Prefers `pvenode task log` (plain text) and falls back to the pvesh JSON
+# endpoint. Returns non-zero when no source can read the log.
+_backup_log_pvenode() {
+    local upid="$1" start=0 out lines total=0
+    while (( total < PH_BACKUP_LOG_MAX_LINES )); do
+        if ! out=$(pvenode task log "$upid" --start "$start" --limit "$PH_BACKUP_LOG_CHUNK" 2>/dev/null); then
+            return 1
+        fi
+        [[ -z $out ]] && break
+        printf '%s\n' "$out"
+        lines=$(printf '%s\n' "$out" | wc -l)
+        total=$((total + lines))
+        (( lines < PH_BACKUP_LOG_CHUNK )) && break
+        start=$((start + PH_BACKUP_LOG_CHUNK))
+    done
+    return 0
+}
+
+_backup_log_pvesh() {
+    local upid="$1" start=0 out objs obj n total=0
+    while (( total < PH_BACKUP_LOG_MAX_LINES )); do
+        if ! out=$(pvesh get "/nodes/${PH_NODE}/tasks/${upid}/log" \
+            --start "$start" --limit "$PH_BACKUP_LOG_CHUNK" --output-format json 2>/dev/null); then
+            return 1
+        fi
+        [[ -z $out ]] && break
+        objs=$(printf '%s' "$out" | json_lines)
+        [[ -z $objs ]] && break
+        n=0
+        while IFS= read -r obj; do
+            [[ -z $obj ]] && continue
+            n=$((n + 1))
+            json_get "$obj" t
+        done <<<"$objs"
+        total=$((total + n))
+        (( n < PH_BACKUP_LOG_CHUNK )) && break
+        start=$((start + PH_BACKUP_LOG_CHUNK))
+    done
+    return 0
+}
+
+backup_task_log() {  # <upid> -> task log on stdout
+    local upid="$1" out
+    if have pvenode; then
+        if out=$(_backup_log_pvenode "$upid"); then
+            printf '%s\n' "$out"
+            return 0
+        fi
+    fi
+    if have pvesh; then
+        if out=$(_backup_log_pvesh "$upid"); then
+            printf '%s\n' "$out"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Extract the guests of a vzdump task from its log.
+# Output: one "id|type|name|finished" line per guest, where finished is 1 when
+# the log contains "Finished Backup of VM/CT <id>".
+backup_guests_from_log() {
+    awk '
+        /INFO: Starting Backup of (VM|CT) [0-9]+/ {
+            count++
+            gid[count] = $6
+            gtype[count] = $7
+            gsub(/[()]/, "", gtype[count])
+            gname[count] = ""
+            next
+        }
+        /INFO: (VM|CT) Name:/ {
+            if (count > 0 && gname[count] == "") {
+                text = $0
+                sub(/^INFO: (VM|CT) Name:[[:space:]]*/, "", text)
+                gsub(/\|/, "/", text)
+                gname[count] = text
+            }
+            next
+        }
+        /INFO: Finished Backup of (VM|CT) [0-9]+/ {
+            finished[$6] = 1
+            next
+        }
+        END {
+            for (i = 1; i <= count; i++)
+                printf "%s|%s|%s|%d\n", gid[i], gtype[i], gname[i], (finished[gid[i]] ? 1 : 0)
+        }
+    '
+}
+
+# Print the explicitly selected guest ids from vzdump's command line in the
+# log header. This lets a successful single-job task serve as a complete
+# snapshot, avoiding requests for older logs that cannot improve freshness.
+backup_job_guest_ids_from_log() {
+    awk '
+        /INFO: starting new backup job: vzdump[[:space:]]/ {
+            line = $0
+            sub(/^.*vzdump[[:space:]]+/, "", line)
+            count = split(line, args, /[[:space:]]+/)
+            for (i = 1; i <= count; i++) {
+                if (args[i] ~ /^--/) break
+                if (args[i] ~ /^[0-9]+$/ && !seen[args[i]]) {
+                    seen[args[i]] = 1
+                    print args[i]
+                }
+            }
+            exit
+        }
+    '
+}
+
+# Aggregate one "id|type|name|starttime|status|finished" record per guest and
+# task into one "id|type|name|last_start|last_status|last_finished|last_ok"
+# line per guest:
+#  - last_start/last_status/last_finished describe the most recent task that
+#    included the guest;
+#  - last_ok is the start time of the most recent successful backup (a task
+#    with status OK, or an explicit "Finished Backup" line in a failed task),
+#    or an empty field when the guest was never backed up successfully.
+backup_summarise_guests() {
+    awk -F'|' '
+        {
+            id = $1
+            if (!(id in seen)) { seen[id] = 1; order[++count] = id }
+            if ($2 != "") type[id] = $2
+            if ($3 != "") name[id] = $3
+            start = $4 + 0
+            if (!(id in last_start) || start > last_start[id]) {
+                last_start[id] = start
+                last_status[id] = $5
+                last_finished[id] = $6
+            }
+            if (($5 == "OK" || $6 == 1) && (!(id in last_ok) || start > last_ok[id]))
+                last_ok[id] = start
+        }
+        END {
+            for (i = 1; i <= count; i++) {
+                id = order[i]
+                printf "%s|%s|%s|%s|%s|%s|%s\n", id, type[id], name[id],
+                    last_start[id], last_status[id], last_finished[id],
+                    (id in last_ok ? last_ok[id] : "")
+            }
+        }
+    '
+}
+
 do_backup_status() {
     check_begin backup.status "$(check_title backup.status)"
     if ! have pvesh; then
@@ -1193,7 +1346,7 @@ do_backup_status() {
         return 0
     fi
 
-    local jobs="" jobs_compact
+    local jobs="" jobs_compact jobs_count
     if ! jobs=$(pvesh get /cluster/backup --output-format json 2>/dev/null); then
         warn "could not query configured backup jobs"
         check_end
@@ -1207,9 +1360,16 @@ do_backup_status() {
             return 0
         fi
     fi
+    jobs_count=$(printf '%s' "$jobs" | json_lines | awk 'END { print NR + 0 }')
+
+    local history="$PH_BACKUP_TASK_HISTORY"
+    if ! is_number "$history" || ! gt "$history" 0; then
+        warn "invalid PH_BACKUP_TASK_HISTORY: ${history} (using 30)"
+        history=30
+    fi
 
     local tasks=""
-    if ! tasks=$(pvesh get "/nodes/${PH_NODE}/tasks" --typefilter vzdump --limit 50 --output-format json 2>/dev/null); then
+    if ! tasks=$(pvesh get "/nodes/${PH_NODE}/tasks" --typefilter vzdump --limit "$history" --output-format json 2>/dev/null); then
         warn "could not query recent vzdump tasks for node ${PH_NODE}"
         check_end
         return 0
@@ -1220,76 +1380,196 @@ do_backup_status() {
         return 0
     fi
 
-    _emit ""
-    _emit "$(printf '%-6s %-20s %-10s %s' 'VMID' 'DATE' 'STATUS' 'UPID')"
-    local obj vmid status starttime upid date_str failures now age_days stale
-    local backup_id successful_id
-    local -A backup_seen=() backup_success=() backup_latest_start=() backup_latest_status=()
-    failures=0; stale=0
+    local obj upid status starttime task_id log date_str guests line
+    local gid gtype gname gdone last_start last_status last_finished last_ok
+    local task_guest_count
+    local job_guest_ids task_guest_ids expected_id all_job_guests sole_job_guest_ids
+    local now age unreadable=0 latest_node=0
+    local task_rows="" guest_records=""
+    local -A success_seen=()
+    sole_job_guest_ids=""
+    now=$(date +%s)
+
     while IFS= read -r obj; do
         [[ -z $obj ]] && continue
-        vmid=$(json_get "$obj" id)
+        upid=$(json_get "$obj" upid)
+        [[ -z $upid ]] && continue
         status=$(json_get "$obj" status)
         starttime=$(json_get "$obj" starttime)
-        upid=$(json_get "$obj" upid)
-        if [[ -n $vmid ]]; then
-            backup_seen["$vmid"]=1
-            if [[ -z ${backup_latest_start[$vmid]+set} ]] \
-               || { is_number "${starttime:-}" \
-                    && { ! is_number "${backup_latest_start[$vmid]:-}" \
-                         || gt "$starttime" "${backup_latest_start[$vmid]}"; }; }; then
-                backup_latest_start["$vmid"]="${starttime:-}"
-                backup_latest_status["$vmid"]="$status"
-            fi
-        fi
+        task_id=$(json_get "$obj" id)
+
         date_str="?"
-        if is_number "${starttime:-}"; then
+        if is_number "$starttime"; then
             date_str=$(date -d "@${starttime}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")
-            if [[ $status == OK && -n $vmid ]] \
-               && { [[ -z ${backup_success[$vmid]:-} ]] || gt "$starttime" "${backup_success[$vmid]}"; }; then
-                backup_success["$vmid"]="$starttime"
+        else
+            starttime=0
+        fi
+
+        if [[ $status == OK ]] && gt "$starttime" "$latest_node"; then
+            latest_node="$starttime"
+        fi
+
+        guests=""
+        task_guest_count=0
+        if log=$(backup_task_log "$upid"); then
+            job_guest_ids=$(printf '%s\n' "$log" | backup_job_guest_ids_from_log)
+            task_guest_ids=" "
+            if [[ $jobs_count == 1 && -z $sole_job_guest_ids && -n $job_guest_ids ]]; then
+                sole_job_guest_ids="$job_guest_ids"
+            fi
+            while IFS='|' read -r gid gtype gname gdone; do
+                [[ -z $gid ]] && continue
+                guest_records+="${gid}|${gtype}|${gname}|${starttime}|${status}|${gdone:-0}"$'\n'
+                case "$task_guest_ids" in
+                    *" ${gid} "*) ;;
+                    *)
+                        task_guest_count=$((task_guest_count + 1))
+                        guests+="${guests:+, }${gid}${gname:+ $gname}"
+                        task_guest_ids+="${gid} "
+                        ;;
+                esac
+                if [[ $status == OK || ${gdone:-0} == 1 ]]; then
+                    success_seen["$gid"]=1
+                fi
+            done <<<"$(printf '%s\n' "$log" | backup_guests_from_log)"
+
+            # The command line names all selected guests, including guests
+            # not reached yet by a running or failed task.
+            while IFS= read -r expected_id; do
+                [[ -z $expected_id ]] && continue
+                case "$task_guest_ids" in
+                    *" ${expected_id} "*) ;;
+                    *)
+                        guest_records+="${expected_id}|||${starttime}|${status}|0"$'\n'
+                        task_guest_count=$((task_guest_count + 1))
+                        guests+="${guests:+, }${expected_id}"
+                        task_guest_ids+="${expected_id} "
+                        if [[ $status == OK ]]; then
+                            success_seen["$expected_id"]=1
+                        fi
+                        ;;
+                esac
+            done <<<"$job_guest_ids"
+        else
+            unreadable=$((unreadable + 1))
+            # Fallback: some Proxmox versions report the guest in the task id.
+            if [[ -n $task_id ]]; then
+                guest_records+="${task_id}|||${starttime}|${status}|0"$'\n'
+                guests="$task_id"
+                task_guest_count=1
             fi
         fi
-        _emit "$(printf '%-6s %-20s %-10s %s' "${vmid:-?}" "$date_str" "${status:-?}" "${upid:--}")"
+        task_rows+="$(printf '%-20s %-8s %s guest(s)' \
+            "$date_str" "${status:-?}" "$task_guest_count")"$'\n'
+        task_rows+="  Guests: ${guests:--}"$'\n'
+        task_rows+="  UPID: ${upid}"$'\n'
+
+        # For one explicit configured job, keep walking backward only until
+        # every selected guest has a known successful backup. This normally
+        # reads one log (or two while a current run is still in progress),
+        # rather than all 30 historical task logs.
+        if [[ $jobs_count == 1 && -n $sole_job_guest_ids ]]; then
+            all_job_guests=1
+            while IFS= read -r expected_id; do
+                [[ -z $expected_id ]] && continue
+                if [[ -z ${success_seen[$expected_id]:-} ]]; then
+                    all_job_guests=0
+                    break
+                fi
+            done <<<"$sole_job_guest_ids"
+            (( all_job_guests == 1 )) && break
+        fi
     done < <(printf '%s' "$tasks" | json_lines)
 
     _emit ""
-    for backup_id in "${!backup_latest_status[@]}"; do
-        status="${backup_latest_status[$backup_id]}"
-        case $status in
-            ""|OK|running|null) ;;
-            *) failures=$((failures + 1)) ;;
-        esac
-    done
-    if (( failures > 0 )); then
-        warn "${failures} VM/CT latest vzdump task(s) did not finish OK"
+    _emit "$(printf '%-20s %-8s %s' 'DATE' 'STATUS' 'GUEST COUNT')"
+    while IFS= read -r line; do
+        [[ -n $line ]] && _emit "$line"
+    done <<<"$task_rows"
+
+    if (( unreadable > 0 )); then
+        info "could not read the log of ${unreadable} task(s)"
     fi
-    now=$(date +%s)
+
+    local guest_summary=""
+    if [[ -n ${guest_records//[[:space:]]/} ]]; then
+        guest_summary=$(printf '%s' "$guest_records" \
+            | backup_summarise_guests | sort -t'|' -k1,1n)
+        _emit ""
+        _emit "Latest successful backup per guest"
+        _emit "$(printf '%-7s %-6s %-22s %-20s %s' 'VMID' 'TYPE' 'NAME' 'LAST SUCCESS' 'AGE')"
+        while IFS='|' read -r gid gtype gname last_start last_status last_finished last_ok; do
+            [[ -z $gid ]] && continue
+            if [[ -n $last_ok ]]; then
+                date_str=$(date -d "@${last_ok}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")
+                age=$(( (now - last_ok) / 86400 ))
+                (( age < 0 )) && age=0
+                _emit "$(printf '%-7s %-6s %-22s %-20s %s' "$gid" "${gtype:--}" "${gname:--}" "$date_str" "${age} day(s)")"
+            else
+                _emit "$(printf '%-7s %-6s %-22s %-20s %s' "$gid" "${gtype:--}" "${gname:--}" "never" "-")"
+            fi
+        done <<<"$guest_summary"
+    fi
+
     if ! is_number "$PH_THRESH_BACKUP_AGE_DAYS"; then
         warn "invalid PH_THRESH_BACKUP_AGE_DAYS: $PH_THRESH_BACKUP_AGE_DAYS"
-    elif (( ${#backup_seen[@]} == 0 )); then
-        warn "no vzdump task with a VM/CT id was returned"
-    else
-        for backup_id in "${!backup_seen[@]}"; do
-            successful_id="${backup_success[$backup_id]:-}"
-            if [[ -z $successful_id ]]; then
-                warn "no successful vzdump task found for VM/CT ${backup_id}"
-                continue
+        check_end
+        return 0
+    fi
+
+    if [[ -z $guest_summary ]]; then
+        # No per-guest attribution: fall back to the node-level freshness of
+        # the latest successful vzdump task.
+        info "per-guest backup attribution unavailable (task logs unreadable or no guest ids)"
+        if (( latest_node == 0 )); then
+            warn "no successful vzdump task found for node ${PH_NODE}"
+        else
+            age=$(( (now - latest_node) / 86400 ))
+            (( age < 0 )) && age=0
+            metric "Latest successful vzdump task (node)" "${age} day(s) old"
+            if ge "$age" "$PH_THRESH_BACKUP_AGE_DAYS"; then
+                warn "latest successful vzdump task is ${age} days old (threshold ${PH_THRESH_BACKUP_AGE_DAYS} days)"
+            else
+                ok "latest vzdump task completed successfully (${age} day(s) ago)"
             fi
-            age_days=$(( (now - successful_id) / 86400 ))
-            (( age_days < 0 )) && age_days=0
-            metric "Latest successful backup ${backup_id}" "${age_days} day(s) old"
-            if ge "$age_days" "$PH_THRESH_BACKUP_AGE_DAYS"; then
-                stale=1
-                warn "latest successful backup for ${backup_id} is ${age_days} days old (threshold ${PH_THRESH_BACKUP_AGE_DAYS} days)"
-            fi
-        done
-        if (( failures == 0 )) && [[ ${#backup_success[@]} -eq ${#backup_seen[@]} ]]; then
-            (( stale == 0 )) && ok "recent vzdump tasks completed successfully"
         fi
+        check_end
+        return 0
+    fi
+
+    local stale=0 guests_total=0
+    while IFS='|' read -r gid gtype gname last_start last_status last_finished last_ok; do
+        [[ -z $gid ]] && continue
+        guests_total=$((guests_total + 1))
+        if [[ -z $last_ok ]]; then
+            warn "no successful vzdump task found for VM/CT ${gid}${gname:+ (${gname})}"
+            stale=1
+            continue
+        fi
+        age=$(( (now - last_ok) / 86400 ))
+        (( age < 0 )) && age=0
+        if ge "$age" "$PH_THRESH_BACKUP_AGE_DAYS"; then
+            warn "latest successful backup for VM/CT ${gid}${gname:+ (${gname})} is ${age} days old (threshold ${PH_THRESH_BACKUP_AGE_DAYS} days)"
+            stale=1
+        fi
+        case "$last_status" in
+            OK) ;;
+            running)
+                info "backup in progress for VM/CT ${gid}${gname:+ (${gname})}" ;;
+            *)
+                if [[ $last_finished != 1 ]]; then
+                    warn "latest vzdump task for VM/CT ${gid}${gname:+ (${gname})} did not finish OK"
+                    stale=1
+                fi ;;
+        esac
+    done <<<"$guest_summary"
+
+    if (( stale == 0 )); then
+        ok "recent vzdump tasks completed successfully for ${guests_total} guest(s)"
     fi
     check_end
 }
+
 
 do_replication_status() {
     check_begin replication.status "$(check_title replication.status)"

@@ -141,7 +141,7 @@ Run `proxmox-healthcheck --list-checks` for the current list. See
 | `vm.usage` | real CPU/RAM usage of running guests via `pvesh` |
 | `net.bridges` | bridge state, addresses, member interfaces |
 | `hardware.sensors` | `lm-sensors` and IPMI temperatures/fans |
-| `backup.status` | recent `vzdump` tasks (only if backups are configured) |
+| `backup.status` | recent `vzdump` tasks and per-guest backup freshness, reconstructed from task logs |
 | `replication.status` | `pvesr status` (only if replication is configured) |
 
 ## Configuration
@@ -159,12 +159,14 @@ temperature, backup age, swap usage, ...).
 
 `--config FILE` loads the specified configuration file. SMART checks cover ZFS
 pool disks by default; set `PH_SMART_SCAN_ALL_DISKS=1` to include all physical
-disks reported by `lsblk`.
+disks reported by `lsblk`. `backup.status` reads the log of the most recent
+`PH_BACKUP_TASK_HISTORY` `vzdump` tasks (default 30) to attribute each backup to
+its VM/CT, because scheduled multi-guest tasks often carry no guest id.
 
 ## Testing
 
-The tests use fake `zpool`, `zfs`, `qm`, `pct`, `pvesh`, `smartctl`, `ip`,
-`lsblk` and friends, and need no Proxmox node:
+The tests use fake `zpool`, `zfs`, `qm`, `pct`, `pvesh`, `pvenode`, `smartctl`,
+`ip`, `lsblk` and friends, and need no Proxmox node:
 
 ```sh
 tests/run.sh

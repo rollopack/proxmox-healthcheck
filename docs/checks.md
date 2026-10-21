@@ -128,13 +128,29 @@ are installed. Informational.
 ## backup.status
 
 Only runs when a backup job is configured (`/cluster/backup` or
-`/etc/pve/vzdump.cron`). Lists recent `vzdump` tasks, warns when a VM/CT's
-latest task did not finish with `OK`, when it has no successful task in the returned history,
-or when its latest successful backup is at least
-`PH_THRESH_BACKUP_AGE_DAYS` days old. Skipped if `pvesh` is missing or no backup
-job exists. The latest task status and freshness check are evaluated per VM/CT
-id represented in the returned task history (up to the most recent 50 tasks),
-so an older failed task does not override a newer successful task.
+`/etc/pve/vzdump.cron`). Lists recent `vzdump` tasks and reconstructs the
+guests of each task from its log (`pvenode task log`, with the
+`/nodes/{node}/tasks/{upid}/log` API as fallback), because scheduled
+multi-guest tasks usually carry no guest id. The log is parsed for
+`Starting Backup of VM/CT <id>`, `VM Name:` and `Finished Backup of VM/CT <id>`,
+so `qemu` and `lxc` guests are handled alike and a single task can report
+several guests.
+
+A guest is considered successfully backed up by a task when the task status is
+`OK`, or when a failed task contains its `Finished Backup of VM/CT` line. The
+check warns when a guest has no successful task in the inspected history, when
+its latest successful backup is at least `PH_THRESH_BACKUP_AGE_DAYS` days old,
+or when the most recent task that included it did not finish `OK`. It inspects
+the most recent `PH_BACKUP_TASK_HISTORY` tasks (default 30).
+When exactly one configured job lists its guests in the task-log command line,
+the scan stops once every selected guest has a known successful backup; older
+logs cannot change freshness or the latest-task result.
+
+If no task log can be read, the guest id is taken from the task `id` field when
+Proxmox provides one; otherwise the check falls back to the freshness of the
+latest successful `vzdump` task for the node and reports that per-guest
+attribution is unavailable. The backup `note` field is not used. Skipped if
+`pvesh` is missing or no backup job exists.
 
 ## replication.status
 

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#
+# Fake pvenode: only `pvenode task log <upid>` is implemented.
+
+source "$(dirname "$0")/../lib/task_logs.sh"
+
+case "$*" in
+  *"task log "*)
+    [[ ${PH_TEST_LOG_SOURCE:-auto} == pvesh ]] && exit 1
+    upid="$3"
+    if [[ -n ${PH_TEST_LOG_CALLS:-} ]]; then
+      printf '%s\n' "$upid" >>"$PH_TEST_LOG_CALLS"
+    fi
+    start=0
+    limit=0
+    prev=""
+    for arg in "$@"; do
+      case "$prev" in
+        --start) start="$arg" ;;
+        --limit) limit="$arg" ;;
+      esac
+      prev="$arg"
+    done
+    task_log_exists "${PH_TEST_BACKUP:-empty}" "$upid" || exit 1
+    task_log_lines "${PH_TEST_BACKUP:-empty}" "$upid" "$start" "$limit"
+    ;;
+  *)
+    exit 1
+    ;;
+esac

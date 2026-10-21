@@ -1,5 +1,20 @@
 #!/usr/bin/env bash
 args="$*"
+source "$(dirname "$0")/../lib/task_logs.sh"
+
+log_json() {
+    local upid="$1" start="$2" limit="$3" prof="${PH_TEST_BACKUP:-empty}" n=0 line
+    [[ ${PH_TEST_LOG_SOURCE:-auto} == pvenode ]] && return 1
+    task_log_exists "$prof" "$upid" || return 1
+    printf '['
+    while IFS= read -r line; do
+        n=$((n + 1))
+        (( n > 1 )) && printf ','
+        printf '{"n":%d,"t":"%s"}' "$((start + n))" "$line"
+    done < <(task_log_lines "$prof" "$upid" "$start" "$limit")
+    printf ']\n'
+}
+
 case "$args" in
   *"/cluster/backup"*)
     case "${PH_TEST_BACKUP:-empty}" in
@@ -7,6 +22,26 @@ case "$args" in
       empty-pretty) printf '[\n  ]\n' ;;
       *) echo '[{"id":"backup-job"}]' ;;
     esac
+    ;;
+  *"/log"*)
+    upid=""
+    start=0
+    limit=1000
+    prev=""
+    for arg in "$@"; do
+      case "$prev" in
+        --start) start="$arg" ;;
+        --limit) limit="$arg" ;;
+      esac
+      case "$arg" in
+        */tasks/*/log)
+          upid="${arg#*/tasks/}"
+          upid="${upid%/log}"
+          ;;
+      esac
+      prev="$arg"
+    done
+    log_json "$upid" "$start" "$limit" || exit 1
     ;;
   *"/tasks"*)
     case "${PH_TEST_BACKUP:-empty}" in
@@ -25,12 +60,41 @@ OUT
         ;;
       recent)
         stamp=$(date -d '1 day ago' +%s)
-        oldstamp=$(date -d '2 days ago' +%s)
-        printf '[\n { "id": "100", "status": "OK", "starttime": %s },\n { "id": "200", "status": "OK", "starttime": %s },\n { "id": "100", "status": "ERROR", "starttime": %s }\n]\n' "$stamp" "$stamp" "$oldstamp"
+        printf '[\n { "id": "", "status": "OK", "starttime": %s, "upid": "UPID:node:recent" }\n]\n' "$stamp"
         ;;
       failed)
         stamp=$(date -d '1 day ago' +%s)
-        printf '[\n {"id":"100", "status" : "ERROR", "starttime": %s}\n]\n' "$stamp"
+        printf '[\n {"id":"", "status" : "ERROR", "starttime": %s, "upid": "UPID:node:failed"}\n]\n' "$stamp"
+        ;;
+      partial)
+        stamp=$(date -d '1 day ago' +%s)
+        oldstamp=$(date -d '2 days ago' +%s)
+        printf '[\n { "id": "", "status": "ERROR", "starttime": %s, "upid": "UPID:node:partial-new" },\n { "id": "", "status": "OK", "starttime": %s, "upid": "UPID:node:partial-old" }\n]\n' "$stamp" "$oldstamp"
+        ;;
+      multi)
+        stamp=$(date -d '1 day ago' +%s)
+        printf '[\n { "id": "", "status": "OK", "starttime": %s, "upid": "UPID:node:multi" }\n]\n' "$stamp"
+        ;;
+      paged)
+        stamp=$(date -d '1 day ago' +%s)
+        printf '[\n { "id": "", "status": "OK", "starttime": %s, "upid": "UPID:node:paged" }\n]\n' "$stamp"
+        ;;
+      quick)
+        stamp=$(date -d '1 day ago' +%s)
+        oldstamp=$(date -d '2 days ago' +%s)
+        printf '[\n { "id": "", "status": "OK", "starttime": %s, "upid": "UPID:node:quick" },\n' "$stamp"
+        for i in {2..30}; do
+          printf ' { "id": "", "status": "OK", "starttime": %s, "upid": "UPID:node:old-%s" }%s\n' "$oldstamp" "$i" "$([[ $i -lt 30 ]] && printf ',' || true)"
+        done
+        printf ']\n'
+        ;;
+      nologs)
+        stamp=$(date -d '1 day ago' +%s)
+        printf '[\n { "id": "", "note": "VM 100", "status": "OK", "starttime": %s, "upid": "UPID:node:nologs" }\n]\n' "$stamp"
+        ;;
+      idonly)
+        stamp=$(date -d '1 day ago' +%s)
+        printf '[\n { "id": "100", "status": "OK", "starttime": %s, "upid": "UPID:node:idonly" }\n]\n' "$stamp"
         ;;
       *) echo '[]' ;;
     esac

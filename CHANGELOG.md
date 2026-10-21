@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - 2026-10-21
+
+### Fixed
+
+- Attribute backup tasks to their VMs/CTs by reading the task log, so scheduled
+  `vzdump` tasks without a guest id are no longer reported as a false warning.
+- Report per-guest backup freshness and failures from the log, including
+  multi-guest tasks and failed tasks that completed only some guests.
+- Fall back to the node-level freshness of the latest successful `vzdump` task
+  when task logs cannot be read, instead of emitting a misleading warning.
+- Keep long guest lists and UPIDs distinct in the task report.
+
+### Performance
+
+- Stop scanning older task logs once the sole configured job's selected guests
+  all have known successful backups, avoiding redundant log requests.
+
+### Added
+
+- `PH_BACKUP_TASK_HISTORY` (default 30) controls how many recent `vzdump` tasks
+  are inspected.
+
 ## [0.1.2] - 2026-10-21
 
 ### Fixed

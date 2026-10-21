@@ -40,6 +40,8 @@ make_bin() {
 
 add_proxmox() {
     cp -f "$FIXTURES/bin"/* "$BIN/"
+    mkdir -p "$SANDBOX/lib"
+    cp -f "$FIXTURES/lib"/* "$SANDBOX/lib/"
     chmod +x "$BIN"/* 2>/dev/null || true
 }
 
@@ -58,6 +60,9 @@ run() {
         PH_THRESH_SSD_PE_CYCLES="${PH_TEST_PE_RATING:-0}" \
         PH_TEST_VM_JSON="${PH_TEST_VM_JSON:-compact}" \
         PH_TEST_BACKUP="${PH_TEST_BACKUP:-empty}" \
+        PH_TEST_LOG_SOURCE="${PH_TEST_LOG_SOURCE:-auto}" \
+        PH_TEST_LOG_CALLS="$SANDBOX/log_calls" \
+        PH_BACKUP_TASK_HISTORY="${PH_TEST_BACKUP_HISTORY:-30}" \
         PH_THRESH_BACKUP_AGE_DAYS="${PH_TEST_BACKUP_AGE_DAYS:-7}" \
         PH_SMART_SCAN_ALL_DISKS="${PH_TEST_SMART_SCAN_ALL_DISKS:-0}" \
         "$BASH_BIN" "$SCRIPT" --no-color "$@" 2>&1)
@@ -246,18 +251,20 @@ PH_TEST_BACKUP=stale
 make_bin; add_proxmox
 run -c backup.status
 assert_rc 1
-assert_contains "latest successful backup for"
+assert_contains "latest successful backup for VM/CT 100"
 assert_contains "threshold"
 assert_contains "UPID:node:one,},{two"
 
 # ---------------------------------------------------------------------------
-scenario "backup.status accepts recent successful backup tasks"
+scenario "backup.status derives guests and names from the task log"
 PH_TEST_BACKUP=recent
 make_bin; add_proxmox
 run -c backup.status
 assert_rc 0
-assert_contains "recent vzdump tasks completed successfully"
+assert_contains "recent vzdump tasks completed successfully for 2 guest(s)"
 assert_contains "200"
+assert_contains "ct01"
+assert_contains "lxc"
 assert_not_contains "did not finish OK"
 
 # ---------------------------------------------------------------------------
@@ -266,7 +273,90 @@ PH_TEST_BACKUP=failed
 make_bin; add_proxmox
 run -c backup.status
 assert_rc 1
-assert_contains "no successful vzdump task found"
+assert_contains "no successful vzdump task found for VM/CT 100"
+
+# ---------------------------------------------------------------------------
+scenario "backup.status lists every guest of a multi-guest task"
+PH_TEST_BACKUP=multi
+make_bin; add_proxmox
+run -c backup.status
+assert_rc 0
+assert_contains "100 CHR"
+assert_contains "102 Danea"
+assert_contains "103 mailserver"
+assert_contains "Latest successful backup per guest"
+assert_contains "GUEST COUNT"
+assert_contains "  UPID: UPID:node:multi"
+assert_not_contains "no vzdump task with a VM/CT id"
+
+# ---------------------------------------------------------------------------
+scenario "backup.status reports a guest that did not finish in the latest task"
+PH_TEST_BACKUP=partial
+make_bin; add_proxmox
+: >"$SANDBOX/log_calls"
+run -c backup.status
+assert_rc 1
+assert_contains "latest vzdump task for VM/CT 102 (Danea) did not finish OK"
+assert_not_contains "for VM/CT 100"
+if [ "$(wc -l <"$SANDBOX/log_calls")" -eq 2 ]; then
+    t_pass "read only until both guests had a successful backup"
+else
+    t_fail "expected 2 task log reads, got $(wc -l <"$SANDBOX/log_calls")"
+fi
+
+# ---------------------------------------------------------------------------
+scenario "backup.status falls back to node freshness when task logs are unreadable"
+PH_TEST_BACKUP=nologs
+make_bin; add_proxmox
+run -c backup.status
+assert_rc 0
+assert_contains "per-guest backup attribution unavailable"
+assert_contains "latest vzdump task completed successfully"
+assert_not_contains "no vzdump task with a VM/CT id"
+assert_not_contains "VM 100"
+
+# ---------------------------------------------------------------------------
+scenario "backup.status uses the task id when the log is unreadable"
+PH_TEST_BACKUP=idonly
+make_bin; add_proxmox
+run -c backup.status
+assert_rc 0
+assert_contains "could not read the log of 1 task(s)"
+assert_contains "recent vzdump tasks completed successfully for 1 guest(s)"
+
+# ---------------------------------------------------------------------------
+scenario "backup.status reads task logs through the pvesh JSON endpoint"
+PH_TEST_BACKUP=multi
+PH_TEST_LOG_SOURCE=pvesh
+make_bin; add_proxmox
+run -c backup.status
+assert_rc 0
+assert_contains "103 mailserver"
+PH_TEST_LOG_SOURCE=auto
+
+# ---------------------------------------------------------------------------
+scenario "backup.status pages through long task logs"
+PH_TEST_BACKUP=paged
+make_bin; add_proxmox
+run -c backup.status
+assert_rc 0
+assert_contains "100 CHR"
+assert_contains "105 last"
+assert_contains "2 guest(s)"
+
+# ---------------------------------------------------------------------------
+scenario "backup.status stops reading history after a complete recent job"
+PH_TEST_BACKUP=quick
+make_bin; add_proxmox
+: >"$SANDBOX/log_calls"
+run -c backup.status
+assert_rc 0
+assert_contains "recent vzdump tasks completed successfully for 2 guest(s)"
+if [ "$(wc -l <"$SANDBOX/log_calls")" -eq 1 ]; then
+    t_pass "read only the latest task log"
+else
+    t_fail "expected 1 task log read, got $(wc -l <"$SANDBOX/log_calls")"
+fi
 
 # ---------------------------------------------------------------------------
 scenario "backup.status accepts a whitespace-formatted empty job list"

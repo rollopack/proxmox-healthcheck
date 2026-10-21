@@ -75,3 +75,7 @@
 
 # Maximum age in days of the latest successful vzdump per VM/CT (>= warn).
 # PH_THRESH_BACKUP_AGE_DAYS=7
+
+# How many recent vzdump tasks to inspect when reconstructing the per-guest
+# backup history from the task logs. Default 30.
+# PH_BACKUP_TASK_HISTORY=30
