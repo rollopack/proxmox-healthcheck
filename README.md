@@ -183,4 +183,4 @@ add or update a test in `tests/run.sh` for behavioural changes, and make sure
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+GPLv3. See [LICENSE](LICENSE).

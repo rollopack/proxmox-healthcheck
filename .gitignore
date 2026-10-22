@@ -29,3 +29,6 @@ pve-report*.txt
 # --- Local tooling artifacts ----------------------------------------------
 shellcheck-*.tar.xz
 shellcheck-v*/
+
+# Agent notes
+AGENTS.md
